@@ -2,7 +2,7 @@ import discord
 import asyncio
 import re
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pytz
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@ intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
 
-# Tracks which alerts have already been sent today: key = "MM/DD/YYYY-HH:MM-player1vplayer2"
+# Tracks which alerts have already been sent: key = "MM/DD/YYYY-HH:MM-player1vplayer2"
 sent_alerts: set[str] = set()
 last_reset_date: date = None
 
@@ -27,19 +27,22 @@ def parse_picks(text: str, today: date) -> list[dict]:
     Parse lines like:
       10:40am sturma vs Cecotka OVER and SplitDD
       01:40pm Krupnik vs Zika OVER
-    Returns list of dicts with keys: match_time (datetime), player1, player2, pick, alert_key
+
+    Match times are always treated as TODAY's date.
+    This supports overnight posts (posted yesterday for today's matches).
     """
     picks = []
-    # Match: time, player1 vs player2, pick (rest of line)
     pattern = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+(.+?)\s+vs\s+(.+?)\s+((?:OVER|UNDER|SplitDD|Split DD).+?)$",
         re.IGNORECASE | re.MULTILINE,
     )
 
     for m in pattern.finditer(text):
-        time_str, player1, player2, pick = m.group(1), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+        time_str = m.group(1).strip()
+        player1 = m.group(2).strip()
+        player2 = m.group(3).strip()
+        pick = m.group(4).strip()
 
-        # Parse time — attach today's date
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
@@ -72,7 +75,6 @@ def build_alert_message(pick: dict) -> str:
 
 
 async def send_dm_to_all_members(guild: discord.Guild, message: str):
-    """DM every member who can receive DMs."""
     count = 0
     for member in guild.members:
         if member.bot:
@@ -95,6 +97,46 @@ async def get_picks_channel(guild: discord.Guild):
     return None
 
 
+async def find_relevant_message(channel, today: date):
+    """
+    Scan the last 20 messages and find the best candidate:
+    - Priority 1: a message posted OR edited today
+    - Priority 2: a message posted yesterday (overnight post for today's matches)
+    We pick the most recently active one.
+    """
+    yesterday = today - timedelta(days=1)
+    best = None
+    best_ts = None
+
+    try:
+        messages = [msg async for msg in channel.history(limit=20)]
+    except Exception as e:
+        print(f"Error reading channel: {e}")
+        return None
+
+    for msg in messages:
+        post_date = msg.created_at.astimezone(EST).date()
+        edit_date = msg.edited_at.astimezone(EST).date() if msg.edited_at else None
+
+        # Most recent activity timestamp for this message
+        last_activity = msg.edited_at if msg.edited_at else msg.created_at
+
+        is_today = (post_date == today) or (edit_date == today)
+        is_yesterday = (post_date == yesterday) or (edit_date == yesterday)
+
+        if is_today:
+            if best_ts is None or last_activity > best_ts:
+                best = msg
+                best_ts = last_activity
+        elif is_yesterday and best is None:
+            # Only use yesterday's message as fallback if nothing from today found
+            if best_ts is None or last_activity > best_ts:
+                best = msg
+                best_ts = last_activity
+
+    return best
+
+
 async def scanner_loop():
     await client.wait_until_ready()
     global last_reset_date, sent_alerts
@@ -114,37 +156,15 @@ async def scanner_loop():
         for guild in client.guilds:
             channel = await get_picks_channel(guild)
             if channel is None:
-                print(f"⚠️  Could not find channel '{PICKS_CHANNEL_NAME}' in {guild.name}")
+                print(f"⚠️  Could not find '{PICKS_CHANNEL_NAME}' in {guild.name}")
                 continue
 
-            # Get the most recent message in the channel
-            try:
-                messages = [msg async for msg in channel.history(limit=10)]
-            except Exception as e:
-                print(f"Error reading channel: {e}")
+            msg = await find_relevant_message(channel, today)
+            if msg is None:
                 continue
 
-            # Find the most recent message posted today
-            todays_message = None
-            for msg in messages:
-                msg_date = msg.created_at.astimezone(EST).date()
-                if msg_date == today:
-                    todays_message = msg
-                    break
-
-            if todays_message is None:
-                # Also check if any message was edited today
-                for msg in messages:
-                    if msg.edited_at:
-                        edit_date = msg.edited_at.astimezone(EST).date()
-                        if edit_date == today:
-                            todays_message = msg
-                            break
-
-            if todays_message is None:
-                continue
-
-            picks = parse_picks(todays_message.content, today)
+            picks = parse_picks(msg.content, today)
+            print(f"📋 Found {len(picks)} picks in message.")
 
             for pick in picks:
                 if pick["alert_key"] in sent_alerts:
@@ -152,9 +172,9 @@ async def scanner_loop():
 
                 seconds_until = (pick["match_time"] - now_est).total_seconds()
 
-                # Alert window: between 2 min 30 sec and 1 min 30 sec before match
+                # Alert window: 90–150 seconds before match (centered on 2 min)
                 if 90 <= seconds_until <= 150:
-                    print(f"🚨 Sending alert: {pick['player1']} vs {pick['player2']} at {pick['match_time'].strftime('%I:%M %p')}")
+                    print(f"🚨 Alerting: {pick['player1']} vs {pick['player2']} at {pick['match_time'].strftime('%I:%M %p')}")
                     alert_msg = build_alert_message(pick)
                     await send_dm_to_all_members(guild, alert_msg)
                     sent_alerts.add(pick["alert_key"])
