@@ -1,24 +1,70 @@
 import asyncio
 import aiohttp
-import json
 import re
 import os
 from datetime import datetime, date, timedelta
 import pytz
- 
+
 # ── Config ──────────────────────────────────────────────────────────────────
 TOKEN = os.environ["DISCORD_TOKEN"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PICKS_CHANNEL_ID = "1466857635746808020"
 EST = pytz.timezone("US/Eastern")
 CHECK_INTERVAL = 60
-API = "https://discord.com/api/v10"
-HEADERS = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
- 
-sent_alerts: set[str] = set()
-last_reset_date: date = None
- 
- 
-def parse_picks(text: str, today: date) -> list[dict]:
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_HEADERS = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates"
+}
+
+EST_now = lambda: datetime.now(EST)
+
+
+# ── Supabase helpers ─────────────────────────────────────────────────────────
+
+async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
+    """Insert or update a pick in the database."""
+    url = f"{SUPABASE_URL}/rest/v1/picks"
+    payload = {
+        "match_date": pick["match_time"].date().isoformat(),
+        "match_time": pick["match_time"].isoformat(),
+        "player1": pick["player1"],
+        "player2": pick["player2"],
+        "pick": pick["pick"],
+        "alert_key": pick["alert_key"],
+        "alert_sent": False
+    }
+    async with session.post(url, headers=SUPABASE_HEADERS, json=payload) as r:
+        if r.status not in (200, 201):
+            text = await r.text()
+            print(f"⚠️ DB upsert failed: {r.status} {text}")
+
+
+async def db_get_pending_alerts(session: aiohttp.ClientSession, today: date) -> list:
+    """Get all picks for today that haven't been alerted yet."""
+    url = f"{SUPABASE_URL}/rest/v1/picks?match_date=eq.{today.isoformat()}&alert_sent=eq.false&select=*"
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            print(f"⚠️ DB fetch failed: {r.status}")
+            return []
+        return await r.json()
+
+
+async def db_mark_alert_sent(session: aiohttp.ClientSession, alert_key: str):
+    """Mark a pick as alerted."""
+    url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
+    async with session.patch(url, headers=SUPABASE_HEADERS, json={"alert_sent": True}) as r:
+        if r.status not in (200, 204):
+            print(f"⚠️ DB mark sent failed: {r.status}")
+
+
+# ── Pick parsing ─────────────────────────────────────────────────────────────
+
+def parse_picks(text: str, post_date: date) -> list[dict]:
     picks = []
     pattern = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+(.+?)\s+vs\s+(.+?)\s+((?:OVER|UNDER|SplitDD|Split DD).+?)$",
@@ -31,10 +77,17 @@ def parse_picks(text: str, today: date) -> list[dict]:
         pick = m.group(4).strip()
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
-            match_dt = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
+            # Assign match to post_date by default
+            match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
+            # If match is early morning (12am-6am) and posted in the evening (after 9pm),
+            # it's for the next day
+            now = EST_now()
+            if t.hour < 6 and now.hour >= 21:
+                next_day = post_date + timedelta(days=1)
+                match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
         except ValueError:
             continue
-        alert_key = f"{today.strftime('%m/%d/%Y')}-{match_dt.strftime('%H:%M')}-{player1.lower()}v{player2.lower()}"
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ','')}v{player2.lower().replace(' ','')}"
         picks.append({
             "match_time": match_dt,
             "player1": player1,
@@ -43,27 +96,54 @@ def parse_picks(text: str, today: date) -> list[dict]:
             "alert_key": alert_key,
         })
     return picks
- 
- 
+
+
+# ── Discord helpers ──────────────────────────────────────────────────────────
+
 def build_alert_message(pick: dict) -> str:
-    match_time_str = pick["match_time"].strftime("%I:%M %p EDT")
-    match_date_str = pick["match_time"].strftime("%A, %m/%d/%Y")
+    match_time_str = pick["match_time"].strftime("%I:%M %p EDT") if isinstance(pick["match_time"], datetime) else pick["match_time"]
+    if isinstance(pick["match_time"], str):
+        match_dt = datetime.fromisoformat(pick["match_time"])
+        match_time_str = match_dt.astimezone(EST).strftime("%I:%M %p EDT")
+        match_date_str = match_dt.astimezone(EST).strftime("%A, %m/%d/%Y")
+    else:
+        match_time_str = pick["match_time"].strftime("%I:%M %p EDT")
+        match_date_str = pick["match_time"].strftime("%A, %m/%d/%Y")
     return (
-        f"🏓 **MATCH STARTING IN 2 MINUTES!**\n\n"
+        f"🏓 **MATCH STARTING IN 1 MINUTE!**\n\n"
         f"{pick['player1']} vs {pick['player2']}\n"
         f"Pick: {pick['pick']}\n"
         f"Date: {match_date_str}\n"
         f"Time: {match_time_str}\n\n"
         f"Good luck! 🍀"
     )
- 
- 
+
+
+async def get_guild_id(session: aiohttp.ClientSession) -> str | None:
+    url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}"
+    async with session.get(url, headers=DISCORD_HEADERS) as r:
+        if r.status != 200:
+            print(f"⚠️ Failed to fetch channel info: {r.status}")
+            return None
+        data = await r.json()
+        return data.get("guild_id")
+
+
+async def get_channel_messages(session: aiohttp.ClientSession) -> list:
+    url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages?limit=20"
+    async with session.get(url, headers=DISCORD_HEADERS) as r:
+        if r.status != 200:
+            print(f"⚠️ Failed to fetch messages: {r.status}")
+            return []
+        return await r.json()
+
+
 async def get_guild_members(session: aiohttp.ClientSession, guild_id: str) -> list:
     members = []
     after = "0"
     while True:
-        url = f"{API}/guilds/{guild_id}/members?limit=1000&after={after}"
-        async with session.get(url, headers=HEADERS) as r:
+        url = f"{DISCORD_API}/guilds/{guild_id}/members?limit=1000&after={after}"
+        async with session.get(url, headers=DISCORD_HEADERS) as r:
             batch = await r.json()
             if not batch or not isinstance(batch, list):
                 break
@@ -72,142 +152,117 @@ async def get_guild_members(session: aiohttp.ClientSession, guild_id: str) -> li
                 break
             after = batch[-1]["user"]["id"]
     return members
- 
- 
+
+
 async def send_dm(session: aiohttp.ClientSession, user_id: str, message: str):
-    # Create DM channel
-    async with session.post(f"{API}/users/@me/channels",
-                            headers=HEADERS,
+    async with session.post(f"{DISCORD_API}/users/@me/channels",
+                            headers=DISCORD_HEADERS,
                             json={"recipient_id": user_id}) as r:
         if r.status != 200:
             return
         dm = await r.json()
         dm_channel_id = dm["id"]
- 
-    # Send message
-    async with session.post(f"{API}/channels/{dm_channel_id}/messages",
-                            headers=HEADERS,
+    async with session.post(f"{DISCORD_API}/channels/{dm_channel_id}/messages",
+                            headers=DISCORD_HEADERS,
                             json={"content": message}) as r:
         if r.status == 429:
             data = await r.json()
             retry_after = data.get("retry_after", 1)
             print(f"⏳ Rate limited, waiting {retry_after}s")
             await asyncio.sleep(retry_after)
- 
- 
-async def get_channel_messages(session: aiohttp.ClientSession) -> list:
-    url = f"{API}/channels/{PICKS_CHANNEL_ID}/messages?limit=20"
-    async with session.get(url, headers=HEADERS) as r:
-        if r.status != 200:
-            print(f"⚠️ Failed to fetch messages: {r.status}")
-            return []
-        return await r.json()
- 
- 
-async def get_guild_id(session: aiohttp.ClientSession) -> str | None:
-    url = f"{API}/channels/{PICKS_CHANNEL_ID}"
-    async with session.get(url, headers=HEADERS) as r:
-        if r.status != 200:
-            print(f"⚠️ Failed to fetch channel info: {r.status}")
-            return None
-        data = await r.json()
-        return data.get("guild_id")
- 
- 
-async def find_relevant_message(messages: list, today: date):
+
+
+# ── Message sync — saves picks to DB ────────────────────────────────────────
+
+async def sync_picks_from_channel(session: aiohttp.ClientSession):
+    """Read recent messages and save any new/updated picks to the database."""
+    messages = await get_channel_messages(session)
+    today = EST_now().date()
     yesterday = today - timedelta(days=1)
-    best = None
-    best_ts = None
- 
+    count = 0
+
     for msg in messages:
         if msg.get("author", {}).get("bot"):
             continue
- 
+
         post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
         post_date = post_dt.date()
- 
-        edit_date = None
+
         if msg.get("edited_timestamp"):
             edit_dt = datetime.fromisoformat(msg["edited_timestamp"].replace("Z", "+00:00")).astimezone(EST)
-            edit_date = edit_dt.date()
-            last_activity = edit_dt
+            effective_date = edit_dt.date()
         else:
-            last_activity = post_dt
- 
-        is_today = (post_date == today) or (edit_date == today)
-        is_yesterday = (post_date == yesterday) or (edit_date == yesterday)
- 
-        if is_today:
-            if best_ts is None or last_activity > best_ts:
-                best = msg
-                best_ts = last_activity
-        elif is_yesterday and best is None:
-            if best_ts is None or last_activity > best_ts:
-                best = msg
-                best_ts = last_activity
- 
-    return best
- 
- 
+            effective_date = post_date
+
+        # Only process messages from today or yesterday
+        if effective_date not in (today, yesterday):
+            continue
+
+        content = msg.get("content", "")
+        picks = parse_picks(content, effective_date)
+
+        for pick in picks:
+            await db_upsert_pick(session, pick)
+            count += 1
+
+    if count:
+        print(f"💾 Synced {count} picks to database.")
+
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+
 async def scanner_loop():
-    global last_reset_date, sent_alerts
-    print("🤖 Scanner loop started!")
- 
+    print("🤖 TT Bot starting...")
+
     async with aiohttp.ClientSession() as session:
-        # Get guild ID once
         guild_id = await get_guild_id(session)
         if guild_id is None:
             print("❌ Could not get guild ID. Check token and channel ID.")
             return
         print(f"✅ Connected to guild ID: {guild_id}")
- 
+
         while True:
             try:
-                now_est = datetime.now(EST)
+                now_est = EST_now()
                 today = now_est.date()
- 
-                if last_reset_date != today:
-                    sent_alerts.clear()
-                    last_reset_date = today
-                    print(f"🔄 New day ({today}) — alert history cleared.")
- 
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
-                messages = await get_channel_messages(session)
-                msg = await find_relevant_message(messages, today)
- 
-                if msg is None:
-                    print("📭 No relevant message found for today.")
-                else:
-                    content = msg.get("content", "")
-                    print(f"📨 Found message: {content[:80]}")
-                    picks = parse_picks(content, today)
-                    print(f"📋 Parsed {len(picks)} picks.")
- 
-                    for pick in picks:
-                        if pick["alert_key"] in sent_alerts:
-                            continue
-                        seconds_until = (pick["match_time"] - now_est).total_seconds()
-                        print(f"⏱ {pick['player1']} vs {pick['player2']} in {int(seconds_until)}s")
- 
-                        if 90 <= seconds_until <= 150:
-                            print(f"🚨 Sending alert: {pick['player1']} vs {pick['player2']}")
-                            alert_msg = build_alert_message(pick)
-                            members = await get_guild_members(session, guild_id)
-                            count = 0
-                            for member in members:
-                                user = member.get("user", {})
-                                if user.get("bot"):
-                                    continue
-                                await send_dm(session, user["id"], alert_msg)
-                                count += 1
-                                await asyncio.sleep(0.5)
-                            print(f"✅ Alert sent to {count} members.")
-                            sent_alerts.add(pick["alert_key"])
- 
+
+                # Step 1: Sync picks from Discord channel to database
+                await sync_picks_from_channel(session)
+
+                # Step 2: Check database for picks that need alerting
+                pending = await db_get_pending_alerts(session, today)
+                print(f"📋 {len(pending)} pending alerts in database.")
+
+                for row in pending:
+                    match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
+                    seconds_until = (match_dt - now_est).total_seconds()
+                    print(f"⏱ {row['player1']} vs {row['player2']} in {int(seconds_until)}s")
+
+                    if 30 <= seconds_until <= 90:
+                        print(f"🚨 Sending alert: {row['player1']} vs {row['player2']}")
+                        alert_msg = build_alert_message({
+                            "match_time": match_dt,
+                            "player1": row["player1"],
+                            "player2": row["player2"],
+                            "pick": row["pick"],
+                        })
+                        members = await get_guild_members(session, guild_id)
+                        count = 0
+                        for member in members:
+                            user = member.get("user", {})
+                            if user.get("bot"):
+                                continue
+                            await send_dm(session, user["id"], alert_msg)
+                            count += 1
+                            await asyncio.sleep(0.5)
+                        print(f"✅ Alert sent to {count} members.")
+                        await db_mark_alert_sent(session, row["alert_key"])
+
             except Exception as e:
                 print(f"❌ Scanner error: {e}")
- 
+
             await asyncio.sleep(CHECK_INTERVAL)
- 
- 
+
+
 asyncio.run(scanner_loop())
