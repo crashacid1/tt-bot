@@ -18,7 +18,7 @@ SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates"
+    "Prefer": "return=minimal,resolution=merge-duplicates"
 }
 
 EST_now = lambda: datetime.now(EST)
@@ -45,8 +45,12 @@ async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
 
 
 async def db_get_pending_alerts(session: aiohttp.ClientSession, today: date) -> list:
-    """Get all picks for today that haven't been alerted yet."""
-    url = f"{SUPABASE_URL}/rest/v1/picks?match_date=eq.{today.isoformat()}&alert_sent=eq.false&select=*"
+    """Get all picks that haven't been alerted yet and are coming up in the next 24 hours."""
+    # Use a time range to avoid timezone/date issues
+    now_utc = datetime.now(pytz.utc)
+    from_utc = now_utc.isoformat()
+    to_utc = (now_utc + timedelta(hours=24)).isoformat()
+    url = f"{SUPABASE_URL}/rest/v1/picks?alert_sent=eq.false&match_time=gte.{from_utc}&match_time=lte.{to_utc}&select=*"
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
             print(f"⚠️ DB fetch failed: {r.status}")
