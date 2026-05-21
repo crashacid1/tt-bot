@@ -7,15 +7,14 @@ import pytz
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TOKEN = os.environ["DISCORD_TOKEN"]
-PICKS_CHANNEL_NAME = "table-tennis-picks-🍞🧈"
+PICKS_CHANNEL_ID = 1466857635746808020
 EST = pytz.timezone("US/Eastern")
 CHECK_INTERVAL = 60  # seconds between scans
 
-# ── Bot setup ────────────────────────────────────────────────────────────────
+# ── Intents ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-client = discord.Client(intents=intents)
 
 sent_alerts: set[str] = set()
 last_reset_date: date = None
@@ -77,15 +76,6 @@ async def send_dm_to_all_members(guild: discord.Guild, message: str):
     print(f"✅ Alert sent to {count} members.")
 
 
-async def get_picks_channel(guild: discord.Guild):
-    for channel in guild.text_channels:
-        if channel.name == PICKS_CHANNEL_NAME:
-            return channel
-    print(f"⚠️ Channel '{PICKS_CHANNEL_NAME}' not found in {guild.name}")
-    print(f"Available channels: {[c.name for c in guild.text_channels]}")
-    return None
-
-
 async def find_relevant_message(channel, today: date):
     yesterday = today - timedelta(days=1)
     best = None
@@ -112,15 +102,10 @@ async def find_relevant_message(channel, today: date):
     return best
 
 
-@client.event
-async def on_ready():
-    print(f"✅ Logged in as {client.user} (ID: {client.user.id})")
-    print("🤖 Starting scanner loop...")
-    await scanner_loop()
-
-
-async def scanner_loop():
+async def scanner_loop(client: discord.Client):
     global last_reset_date, sent_alerts
+    await client.wait_until_ready()
+    print("🤖 Scanner loop started!")
 
     while True:
         try:
@@ -132,31 +117,29 @@ async def scanner_loop():
                 last_reset_date = today
                 print(f"🔄 New day ({today}) — alert history cleared.")
 
-            for guild in client.guilds:
-                print(f"🔍 Scanning guild: {guild.name}")
-                channel = await get_picks_channel(guild)
-                if channel is None:
-                    continue
-
+            channel = client.get_channel(PICKS_CHANNEL_ID)
+            if channel is None:
+                print(f"⚠️ Channel ID {PICKS_CHANNEL_ID} not found.")
+            else:
+                print(f"🔍 Scanning channel: #{channel.name}")
                 msg = await find_relevant_message(channel, today)
                 if msg is None:
                     print("📭 No relevant message found for today.")
-                    continue
+                else:
+                    print(f"📨 Found message: {msg.content[:80]}")
+                    picks = parse_picks(msg.content, today)
+                    print(f"📋 Parsed {len(picks)} picks.")
 
-                print(f"📨 Found message: {msg.content[:80]}...")
-                picks = parse_picks(msg.content, today)
-                print(f"📋 Parsed {len(picks)} picks.")
-
-                for pick in picks:
-                    if pick["alert_key"] in sent_alerts:
-                        continue
-                    seconds_until = (pick["match_time"] - now_est).total_seconds()
-                    print(f"⏱ {pick['player1']} vs {pick['player2']} in {int(seconds_until)}s")
-                    if 90 <= seconds_until <= 150:
-                        print(f"🚨 Sending alert for: {pick['player1']} vs {pick['player2']}")
-                        alert_msg = build_alert_message(pick)
-                        await send_dm_to_all_members(guild, alert_msg)
-                        sent_alerts.add(pick["alert_key"])
+                    for pick in picks:
+                        if pick["alert_key"] in sent_alerts:
+                            continue
+                        seconds_until = (pick["match_time"] - now_est).total_seconds()
+                        print(f"⏱ {pick['player1']} vs {pick['player2']} in {int(seconds_until)}s")
+                        if 90 <= seconds_until <= 150:
+                            print(f"🚨 Sending alert: {pick['player1']} vs {pick['player2']}")
+                            alert_msg = build_alert_message(pick)
+                            await send_dm_to_all_members(channel.guild, alert_msg)
+                            sent_alerts.add(pick["alert_key"])
 
         except Exception as e:
             print(f"❌ Scanner error: {e}")
@@ -164,4 +147,14 @@ async def scanner_loop():
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+class TTBot(discord.Client):
+    async def setup_hook(self):
+        print("⚙️ setup_hook called — launching scanner...")
+        self.loop.create_task(scanner_loop(self))
+
+    async def on_ready(self):
+        print(f"✅ Logged in as {self.user} (ID: {self.user.id})")
+
+
+client = TTBot(intents=intents)
 client.run(TOKEN)
