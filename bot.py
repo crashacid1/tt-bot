@@ -18,7 +18,12 @@ SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "return=minimal,resolution=merge-duplicates"
+}
+SUPABASE_UPSERT_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=ignore-duplicates",
 }
 
 EST_now = lambda: datetime.now(EST)
@@ -27,7 +32,7 @@ EST_now = lambda: datetime.now(EST)
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 
 async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert or update a pick in the database."""
+    """Insert a pick, ignore if already exists."""
     url = f"{SUPABASE_URL}/rest/v1/picks"
     payload = {
         "match_date": pick["match_time"].date().isoformat(),
@@ -38,22 +43,30 @@ async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
         "alert_key": pick["alert_key"],
         "alert_sent": False
     }
-    async with session.post(url, headers=SUPABASE_HEADERS, json=payload) as r:
+    async with session.post(url, headers=SUPABASE_UPSERT_HEADERS, json=payload) as r:
         if r.status not in (200, 201):
             text = await r.text()
             print(f"⚠️ DB upsert failed: {r.status} {text}")
 
 
 async def db_get_pending_alerts(session: aiohttp.ClientSession, today: date) -> list:
-    """Get all picks that haven't been alerted yet and are coming up in the next 24 hours."""
-    # Use a time range to avoid timezone/date issues
+    """Get all picks that haven't been alerted yet in the next 24 hours."""
     now_utc = datetime.now(pytz.utc)
-    from_utc = now_utc.isoformat()
-    to_utc = (now_utc + timedelta(hours=24)).isoformat()
-    url = f"{SUPABASE_URL}/rest/v1/picks?alert_sent=eq.false&match_time=gte.{from_utc}&match_time=lte.{to_utc}&select=*"
+    to_utc = (now_utc + timedelta(hours=24))
+    # Format without microseconds for cleaner URL
+    from_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_str = to_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"{SUPABASE_URL}/rest/v1/picks"
+        f"?select=*"
+        f"&alert_sent=eq.false"
+        f"&match_time=gte.{from_str}"
+        f"&match_time=lte.{to_str}"
+    )
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
-            print(f"⚠️ DB fetch failed: {r.status}")
+            text = await r.text()
+            print(f"⚠️ DB fetch failed: {r.status} {text}")
             return []
         return await r.json()
 
