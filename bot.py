@@ -23,7 +23,7 @@ SUPABASE_UPSERT_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=ignore-duplicates",
+    "Prefer": "return=minimal",
 }
 
 EST_now = lambda: datetime.now(EST)
@@ -32,7 +32,14 @@ EST_now = lambda: datetime.now(EST)
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 
 async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert a pick, ignore if already exists."""
+    """Insert a pick only if it doesn't already exist."""
+    check_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}&select=id"
+    async with session.get(check_url, headers=SUPABASE_HEADERS) as r:
+        if r.status == 200:
+            existing = await r.json()
+            if existing:
+                return  # Already exists, skip silently
+
     url = f"{SUPABASE_URL}/rest/v1/picks"
     payload = {
         "match_date": pick["match_time"].date().isoformat(),
@@ -46,14 +53,13 @@ async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
     async with session.post(url, headers=SUPABASE_UPSERT_HEADERS, json=payload) as r:
         if r.status not in (200, 201):
             text = await r.text()
-            print(f"⚠️ DB upsert failed: {r.status} {text}")
+            print(f"⚠️ DB insert failed: {r.status} {text}")
 
 
 async def db_get_pending_alerts(session: aiohttp.ClientSession, today: date) -> list:
     """Get all picks that haven't been alerted yet in the next 24 hours."""
     now_utc = datetime.now(pytz.utc)
     to_utc = (now_utc + timedelta(hours=24))
-    # Format without microseconds for cleaner URL
     from_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     to_str = to_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     url = (
@@ -94,17 +100,14 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         pick = m.group(4).strip()
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
-            # Assign match to post_date by default
             match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-            # If match is early morning (12am-6am) and posted in the evening (after 9pm),
-            # it's for the next day
             now = EST_now()
             if t.hour < 6 and now.hour >= 21:
                 next_day = post_date + timedelta(days=1)
                 match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
         except ValueError:
             continue
-        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ','')}v{player2.lower().replace(' ','')}"
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
         picks.append({
             "match_time": match_dt,
             "player1": player1,
@@ -118,16 +121,14 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
 # ── Discord helpers ──────────────────────────────────────────────────────────
 
 def build_alert_message(pick: dict) -> str:
-    match_time_str = pick["match_time"].strftime("%I:%M %p EDT") if isinstance(pick["match_time"], datetime) else pick["match_time"]
     if isinstance(pick["match_time"], str):
-        match_dt = datetime.fromisoformat(pick["match_time"])
-        match_time_str = match_dt.astimezone(EST).strftime("%I:%M %p EDT")
-        match_date_str = match_dt.astimezone(EST).strftime("%A, %m/%d/%Y")
+        match_dt = datetime.fromisoformat(pick["match_time"]).astimezone(EST)
     else:
-        match_time_str = pick["match_time"].strftime("%I:%M %p EDT")
-        match_date_str = pick["match_time"].strftime("%A, %m/%d/%Y")
+        match_dt = pick["match_time"]
+    match_time_str = match_dt.strftime("%I:%M %p EDT")
+    match_date_str = match_dt.strftime("%A, %m/%d/%Y")
     return (
-        f"🏓 **MATCH STARTING IN 1 MINUTE!**\n\n"
+        f"🏓 **MATCH STARTING IN 90 SECONDS!**\n\n"
         f"{pick['player1']} vs {pick['player2']}\n"
         f"Pick: {pick['pick']}\n"
         f"Date: {match_date_str}\n"
@@ -189,10 +190,9 @@ async def send_dm(session: aiohttp.ClientSession, user_id: str, message: str):
             await asyncio.sleep(retry_after)
 
 
-# ── Message sync — saves picks to DB ────────────────────────────────────────
+# ── Message sync ─────────────────────────────────────────────────────────────
 
 async def sync_picks_from_channel(session: aiohttp.ClientSession):
-    """Read recent messages and save any new/updated picks to the database."""
     messages = await get_channel_messages(session)
     today = EST_now().date()
     yesterday = today - timedelta(days=1)
@@ -211,7 +211,6 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         else:
             effective_date = post_date
 
-        # Only process messages from today or yesterday
         if effective_date not in (today, yesterday):
             continue
 
@@ -244,10 +243,8 @@ async def scanner_loop():
                 today = now_est.date()
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
 
-                # Step 1: Sync picks from Discord channel to database
                 await sync_picks_from_channel(session)
 
-                # Step 2: Check database for picks that need alerting
                 pending = await db_get_pending_alerts(session, today)
                 print(f"📋 {len(pending)} pending alerts in database.")
 
@@ -256,7 +253,7 @@ async def scanner_loop():
                     seconds_until = (match_dt - now_est).total_seconds()
                     print(f"⏱ {row['player1']} vs {row['player2']} in {int(seconds_until)}s")
 
-                    if 30 <= seconds_until <= 90:
+                    if 60 <= seconds_until <= 120:
                         print(f"🚨 Sending alert: {row['player1']} vs {row['player2']}")
                         alert_msg = build_alert_message({
                             "match_time": match_dt,
