@@ -32,14 +32,27 @@ EST_now = lambda: datetime.now(EST)
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 
 async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert a pick only if it doesn't already exist."""
-    check_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}&select=id"
+    """Insert a pick, or update the pick field if it already exists and hasn't been alerted."""
+    check_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}&select=id,pick,alert_sent"
     async with session.get(check_url, headers=SUPABASE_HEADERS) as r:
         if r.status == 200:
             existing = await r.json()
             if existing:
-                return  # Already exists, skip silently
+                row = existing[0]
+                # If already alerted, don't touch it
+                if row.get("alert_sent"):
+                    return
+                # If pick text changed (e.g. OVER → OVER and SplitDD), update it
+                if row.get("pick") != pick["pick"]:
+                    patch_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}"
+                    async with session.patch(patch_url, headers=SUPABASE_HEADERS, json={"pick": pick["pick"]}) as pr:
+                        if pr.status not in (200, 204):
+                            print(f"⚠️ DB update pick failed: {pr.status}")
+                        else:
+                            print(f"✏️ Updated pick: {pick['player1']} vs {pick['player2']} → {pick['pick']}")
+                return
 
+    # New pick — insert it
     url = f"{SUPABASE_URL}/rest/v1/picks"
     payload = {
         "match_date": pick["match_time"].date().isoformat(),
