@@ -87,7 +87,15 @@ async def db_get_pending_alerts(session: aiohttp.ClientSession) -> list:
         return await r.json()
 
 
-async def db_mark_alert_sent(session: aiohttp.ClientSession, alert_key: str):
+async def db_cleanup_old_picks(session: aiohttp.ClientSession):
+    """Delete picks older than 2 days to keep the database clean."""
+    cutoff = (datetime.now(pytz.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = f"{SUPABASE_URL}/rest/v1/picks?match_time=lt.{cutoff}"
+    async with session.delete(url, headers=SUPABASE_HEADERS) as r:
+        if r.status not in (200, 204):
+            print(f"⚠️ DB cleanup failed: {r.status}")
+        else:
+            print(f"🧹 Old picks cleaned up.")
     """Mark a pick as alerted."""
     url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
     async with session.patch(url, headers=SUPABASE_HEADERS, json={"alert_sent": True}) as r:
@@ -100,9 +108,12 @@ async def db_mark_alert_sent(session: aiohttp.ClientSession, alert_key: str):
 def parse_picks(text: str, post_date: date) -> list[dict]:
     picks = []
     pattern = re.compile(
-        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+(.+?)\s+vs\s+(.+?)\s+((?:OVER|UNDER|SplitDD|Split DD).+?)$",
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+(.+?)\s+vs\s+(.+?)\s+((?:OVER|UNDER|SPLIT|SplitDD|Split DD).+?)$",
         re.IGNORECASE | re.MULTILINE,
     )
+    today = EST_now().date()
+    yesterday = today - timedelta(days=1)
+
     for m in pattern.finditer(text):
         time_str = m.group(1).strip()
         player1 = m.group(2).strip()
@@ -111,10 +122,14 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-            now = EST_now()
-            if t.hour < 6 and now.hour >= 21:
+
+            # Only push to next day if:
+            # - match time is early morning (midnight to 6am)
+            # - AND the message was posted yesterday (overnight post for today)
+            if t.hour < 6 and post_date == yesterday:
                 next_day = post_date + timedelta(days=1)
                 match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+
         except ValueError:
             continue
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
@@ -294,10 +309,18 @@ async def scanner_loop():
             return
         print(f"✅ Connected to guild ID: {guild_id}")
 
+        last_cleanup_date = None
+
         while True:
             try:
                 now_est = EST_now()
+                today = now_est.date()
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
+
+                # Run cleanup once per day
+                if last_cleanup_date != today:
+                    await db_cleanup_old_picks(session)
+                    last_cleanup_date = today
 
                 await sync_picks_from_channel(session)
 
