@@ -32,7 +32,6 @@ EST_now = lambda: datetime.now(EST)
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 
 async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert a pick, or update the pick field if it already exists and hasn't been alerted."""
     check_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}&select=id,pick,alert_sent"
     async with session.get(check_url, headers=SUPABASE_HEADERS) as r:
         if r.status == 200:
@@ -44,9 +43,7 @@ async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
                 if row.get("pick") != pick["pick"]:
                     patch_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}"
                     async with session.patch(patch_url, headers=SUPABASE_HEADERS, json={"pick": pick["pick"]}) as pr:
-                        if pr.status not in (200, 204):
-                            print(f"⚠️ DB update pick failed: {pr.status}")
-                        else:
+                        if pr.status in (200, 204):
                             print(f"✏️ Updated pick: {pick['player1']} vs {pick['player2']} → {pick['pick']}")
                 return
 
@@ -67,7 +64,6 @@ async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
 
 
 async def db_get_pending_alerts(session: aiohttp.ClientSession) -> list:
-    """Get all picks that haven't been alerted yet in the next 24 hours."""
     now_utc = datetime.now(pytz.utc)
     to_utc = now_utc + timedelta(hours=24)
     from_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -87,20 +83,21 @@ async def db_get_pending_alerts(session: aiohttp.ClientSession) -> list:
         return await r.json()
 
 
-async def db_cleanup_old_picks(session: aiohttp.ClientSession):
-    """Delete picks older than 2 days to keep the database clean."""
-    cutoff = (datetime.now(pytz.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = f"{SUPABASE_URL}/rest/v1/picks?match_time=lt.{cutoff}"
-    async with session.delete(url, headers=SUPABASE_HEADERS) as r:
-        if r.status not in (200, 204):
-            print(f"⚠️ DB cleanup failed: {r.status}")
-        else:
-            print(f"🧹 Old picks cleaned up.")
-    """Mark a pick as alerted."""
+async def db_mark_alert_sent(session: aiohttp.ClientSession, alert_key: str):
     url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
     async with session.patch(url, headers=SUPABASE_HEADERS, json={"alert_sent": True}) as r:
         if r.status not in (200, 204):
             print(f"⚠️ DB mark sent failed: {r.status}")
+
+
+async def db_cleanup_old_picks(session: aiohttp.ClientSession):
+    cutoff = (datetime.now(pytz.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = f"{SUPABASE_URL}/rest/v1/picks?match_time=lt.{cutoff}"
+    async with session.delete(url, headers=SUPABASE_HEADERS) as r:
+        if r.status in (200, 204):
+            print(f"🧹 Old picks cleaned up.")
+        else:
+            print(f"⚠️ DB cleanup failed: {r.status}")
 
 
 # ── Pick parsing ─────────────────────────────────────────────────────────────
@@ -108,13 +105,14 @@ async def db_cleanup_old_picks(session: aiohttp.ClientSession):
 def parse_picks(text: str, post_date: date) -> list[dict]:
     picks = []
     pattern = re.compile(
-        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"  # time
-        r"(.+?)\s+vs\s+"                     # player1 vs
-        r"(.+?)\s+"                          # player2
-        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).+?)$",  # pick
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
+        r"(.+?)\s+vs\s+"
+        r"(.+?)\s+"
+        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).+?)$",
         re.IGNORECASE | re.MULTILINE,
     )
-    today = EST_now().date()
+    now = EST_now()
+    today = now.date()
     yesterday = today - timedelta(days=1)
 
     for m in pattern.finditer(text):
@@ -126,15 +124,19 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
 
-            # Only push to next day if:
-            # - match time is early morning (midnight to 6am)
-            # - AND the message was posted yesterday (overnight post for today)
-            if t.hour < 6 and post_date == yesterday:
-                next_day = post_date + timedelta(days=1)
-                match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+            if t.hour < 6:
+                if post_date == yesterday:
+                    # Overnight post from yesterday — assign to today
+                    next_day = post_date + timedelta(days=1)
+                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+                elif post_date == today and match_dt < now:
+                    # Posted today but time already passed — assign to tomorrow
+                    next_day = today + timedelta(days=1)
+                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
 
         except ValueError:
             continue
+
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
         picks.append({
             "match_time": match_dt,
@@ -221,9 +223,6 @@ async def send_dm(session: aiohttp.ClientSession, user_id: str, message: str):
 # ── Message sync ─────────────────────────────────────────────────────────────
 
 async def sync_picks_from_channel(session: aiohttp.ClientSession):
-    """Read recent messages and save any new/updated picks to the database.
-    Scans ALL non-bot messages from today or yesterday regardless of who posted.
-    """
     messages = await get_channel_messages(session)
     today = EST_now().date()
     yesterday = today - timedelta(days=1)
@@ -236,15 +235,12 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
         post_date = post_dt.date()
 
-        # Use edit date if available
         if msg.get("edited_timestamp"):
             edit_dt = datetime.fromisoformat(msg["edited_timestamp"].replace("Z", "+00:00")).astimezone(EST)
             effective_date = edit_dt.date()
         else:
             effective_date = post_date
 
-        # Accept messages from today OR yesterday (for overnight posts)
-        # Also accept if the message was posted today regardless of edit
         if post_date not in (today, yesterday) and effective_date not in (today, yesterday):
             continue
 
@@ -252,7 +248,8 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         if not content.strip():
             continue
 
-        picks = parse_picks(content, effective_date if effective_date in (today, yesterday) else post_date)
+        use_date = effective_date if effective_date in (today, yesterday) else post_date
+        picks = parse_picks(content, use_date)
 
         for pick in picks:
             await db_upsert_pick(session, pick)
@@ -262,10 +259,9 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         print(f"💾 Synced {count} picks to database.")
 
 
-# ── Alert sender — sends ALL pending alerts in window concurrently ────────────
+# ── Alert sender ─────────────────────────────────────────────────────────────
 
 async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: list, now_est: datetime):
-    """Find all picks in the alert window and send them all."""
     alerts_to_send = []
     for row in pending:
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
@@ -277,7 +273,6 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
     if not alerts_to_send:
         return
 
-    # Fetch members once for all alerts
     members = await get_guild_members(session, guild_id)
     real_members = [m for m in members if not m.get("user", {}).get("bot")]
 
@@ -320,7 +315,6 @@ async def scanner_loop():
                 today = now_est.date()
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
 
-                # Run cleanup once per day
                 if last_cleanup_date != today:
                     await db_cleanup_old_picks(session)
                     last_cleanup_date = today
