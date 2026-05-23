@@ -108,7 +108,10 @@ async def db_cleanup_old_picks(session: aiohttp.ClientSession):
 def parse_picks(text: str, post_date: date) -> list[dict]:
     picks = []
     pattern = re.compile(
-        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+(.+?)\s+vs\s+(.+?)\s+((?:OVER|UNDER|SPLIT|SplitDD|Split DD).+?)$",
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"  # time
+        r"(.+?)\s+vs\s+"                     # player1 vs
+        r"(.+?)\s+"                          # player2
+        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).+?)$",  # pick
         re.IGNORECASE | re.MULTILINE,
     )
     today = EST_now().date()
