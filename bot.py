@@ -241,6 +241,7 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
 
     # Fetch all existing keys in ONE query
     existing = await db_get_existing_keys(session, today)
+    print(f"📦 {len(existing)} picks already in DB.")
 
     all_picks = []
     for msg in messages:
@@ -265,7 +266,10 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
 
         use_date = effective_date if effective_date in (today, yesterday) else post_date
         picks = parse_picks(content, use_date)
+        print(f"📝 Message from {post_date} (effective: {effective_date}): {len(picks)} picks parsed.")
         all_picks.extend(picks)
+
+    print(f"🔎 Total picks parsed from channel: {len(all_picks)}")
 
     # Now insert/update in minimal API calls
     inserts = 0
@@ -283,6 +287,8 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
 
     if inserts or updates:
         print(f"💾 Synced: {inserts} new, {updates} updated.")
+    else:
+        print(f"✅ No new picks to sync.")
 
 
 # In-memory set to prevent duplicate alerts within the same session
