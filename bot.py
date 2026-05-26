@@ -31,22 +31,25 @@ EST_now = lambda: datetime.now(EST)
 
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 
-async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
-    check_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}&select=id,pick,alert_sent"
-    async with session.get(check_url, headers=SUPABASE_HEADERS) as r:
-        if r.status == 200:
-            existing = await r.json()
-            if existing:
-                row = existing[0]
-                if row.get("alert_sent"):
-                    return
-                if row.get("pick") != pick["pick"]:
-                    patch_url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{pick['alert_key']}"
-                    async with session.patch(patch_url, headers=SUPABASE_HEADERS, json={"pick": pick["pick"]}) as pr:
-                        if pr.status in (200, 204):
-                            print(f"✏️ Updated pick: {pick['player1']} vs {pick['player2']} → {pick['pick']}")
-                return
+async def db_get_existing_keys(session: aiohttp.ClientSession, today: date) -> dict:
+    """Fetch all existing picks for today and yesterday in one query. Returns {alert_key: {pick, alert_sent}}"""
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+    url = (
+        f"{SUPABASE_URL}/rest/v1/picks"
+        f"?select=alert_key,pick,alert_sent"
+        f"&match_date=gte.{yesterday.isoformat()}"
+        f"&match_date=lte.{tomorrow.isoformat()}"
+    )
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            return {}
+        rows = await r.json()
+        return {row["alert_key"]: row for row in rows}
 
+
+async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
+    """Insert a new pick."""
     url = f"{SUPABASE_URL}/rest/v1/picks"
     payload = {
         "match_date": pick["match_time"].date().isoformat(),
@@ -61,6 +64,14 @@ async def db_upsert_pick(session: aiohttp.ClientSession, pick: dict):
         if r.status not in (200, 201):
             text = await r.text()
             print(f"⚠️ DB insert failed: {r.status} {text}")
+
+
+async def db_update_pick(session: aiohttp.ClientSession, alert_key: str, new_pick: str):
+    """Update pick text for an existing pick."""
+    url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
+    async with session.patch(url, headers=SUPABASE_HEADERS, json={"pick": new_pick}) as r:
+        if r.status in (200, 204):
+            print(f"✏️ Updated pick for {alert_key}")
 
 
 async def db_get_pending_alerts(session: aiohttp.ClientSession) -> list:
@@ -226,8 +237,11 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
     messages = await get_channel_messages(session)
     today = EST_now().date()
     yesterday = today - timedelta(days=1)
-    count = 0
 
+    # Fetch all existing keys in ONE query
+    existing = await db_get_existing_keys(session, today)
+
+    all_picks = []
     for msg in messages:
         if msg.get("author", {}).get("bot"):
             continue
@@ -250,13 +264,24 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
 
         use_date = effective_date if effective_date in (today, yesterday) else post_date
         picks = parse_picks(content, use_date)
+        all_picks.extend(picks)
 
-        for pick in picks:
-            await db_upsert_pick(session, pick)
-            count += 1
+    # Now insert/update in minimal API calls
+    inserts = 0
+    updates = 0
+    for pick in all_picks:
+        key = pick["alert_key"]
+        if key in existing:
+            row = existing[key]
+            if not row.get("alert_sent") and row.get("pick") != pick["pick"]:
+                await db_update_pick(session, key, pick["pick"])
+                updates += 1
+        else:
+            await db_insert_pick(session, pick)
+            inserts += 1
 
-    if count:
-        print(f"💾 Synced {count} picks to database.")
+    if inserts or updates:
+        print(f"💾 Synced: {inserts} new, {updates} updated.")
 
 
 # ── Alert sender ─────────────────────────────────────────────────────────────
