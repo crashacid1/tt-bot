@@ -27,6 +27,7 @@ SUPABASE_UPSERT_HEADERS = {
 }
 
 EST_now = lambda: datetime.now(EST)
+TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 second timeout on all requests
 
 
 # ── Supabase helpers ─────────────────────────────────────────────────────────
@@ -120,7 +121,7 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         r"(.+?)\s+vs\s+"
         r"(.+?)\s+"
         r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).+?)$",
-        re.IGNORECASE | re.MULTILINE,
+        re.IGNORECASE | re.MULTILINE | re.UNICODE,
     )
     now = EST_now()
     today = now.date()
@@ -325,7 +326,7 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
 async def scanner_loop():
     print("🤖 TT Bot starting...")
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         guild_id = await get_guild_id(session)
         if guild_id is None:
             print("❌ Could not get guild ID. Check token and channel ID.")
@@ -344,13 +345,24 @@ async def scanner_loop():
                     await db_cleanup_old_picks(session)
                     last_cleanup_date = today
 
-                await sync_picks_from_channel(session)
+                # Wrap each cycle in a timeout so a freeze never lasts more than 30s
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        sync_picks_from_channel(session),
+                    ),
+                    timeout=30
+                )
 
                 pending = await db_get_pending_alerts(session)
                 print(f"📋 {len(pending)} pending alerts in database.")
 
-                await send_alerts(session, guild_id, pending, now_est)
+                await asyncio.wait_for(
+                    send_alerts(session, guild_id, pending, now_est),
+                    timeout=60
+                )
 
+            except asyncio.TimeoutError:
+                print("⚠️ Scan cycle timed out — restarting loop.")
             except Exception as e:
                 print(f"❌ Scanner error: {e}")
 
