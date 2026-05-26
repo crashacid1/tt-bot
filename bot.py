@@ -11,7 +11,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PICKS_CHANNEL_ID = "1466857635746808020"
 EST = pytz.timezone("US/Eastern")
-CHECK_INTERVAL = 60
+CHECK_INTERVAL = 20  # seconds between scans
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_HEADERS = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
 SUPABASE_HEADERS = {
@@ -267,7 +267,7 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
         seconds_until = (match_dt - now_est).total_seconds()
         print(f"⏱ {row['player1']} vs {row['player2']} in {int(seconds_until)}s")
-        if 60 <= seconds_until <= 150:
+        if 60 <= seconds_until <= 180:
             alerts_to_send.append(row)
 
     if not alerts_to_send:
