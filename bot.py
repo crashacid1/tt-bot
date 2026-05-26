@@ -285,19 +285,29 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         print(f"💾 Synced: {inserts} new, {updates} updated.")
 
 
+# In-memory set to prevent duplicate alerts within the same session
+alerts_in_progress: set = set()
+
+
 # ── Alert sender ─────────────────────────────────────────────────────────────
 
 async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: list, now_est: datetime):
+    global alerts_in_progress
     alerts_to_send = []
     for row in pending:
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
         seconds_until = (match_dt - now_est).total_seconds()
         print(f"⏱ {row['player1']} vs {row['player2']} in {int(seconds_until)}s")
         if 60 <= seconds_until <= 180:
-            alerts_to_send.append(row)
+            if row["alert_key"] not in alerts_in_progress:
+                alerts_to_send.append(row)
 
     if not alerts_to_send:
         return
+
+    # Mark as in-progress immediately to prevent duplicate sends
+    for row in alerts_to_send:
+        alerts_in_progress.add(row["alert_key"])
 
     members = await get_guild_members(session, guild_id)
     real_members = [m for m in members if not m.get("user", {}).get("bot")]
