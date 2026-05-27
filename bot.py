@@ -116,18 +116,25 @@ async def db_cleanup_old_picks(session: aiohttp.ClientSession):
 
 def parse_picks(text: str, post_date: date) -> list[dict]:
     picks = []
-    pattern = re.compile(
+    # Pattern 1: standard format - TIME Player1 vs Player2 PICK
+    pattern1 = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
         r"(.+?)\s+vs\s+"
         r"(.+?)\s+"
-        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).+?)$",
-        re.IGNORECASE | re.MULTILINE | re.UNICODE,
+        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).*)$",
+        re.IGNORECASE | re.MULTILINE,
     )
-    now = EST_now()
-    today = now.date()
-    yesterday = today - timedelta(days=1)
+    # Pattern 2: spread format - TIME Player1 -X.X spread vs Player2
+    pattern2 = re.compile(
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
+        r"(\w+(?:\s+\w+)?)\s+"          # player1 (1-2 words)
+        r"(-\d+\.?\d*[^v]+?)\s+vs\s+"  # spread pick
+        r"(\w+(?:\s+\w+)?)(.*)$",       # player2
+        re.IGNORECASE | re.MULTILINE,
+    )
 
-    for m in pattern.finditer(text):
+    seen_keys = set()
+    for m in pattern1.finditer(text):
         time_str = m.group(1).strip()
         player1 = m.group(2).strip()
         player2 = m.group(3).strip()
@@ -135,28 +142,42 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-
             if t.hour < 6:
                 if post_date == yesterday:
-                    # Overnight post from yesterday — assign to today
                     next_day = post_date + timedelta(days=1)
                     match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
                 elif post_date == today and match_dt < now:
-                    # Posted today but time already passed — assign to tomorrow
                     next_day = today + timedelta(days=1)
                     match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
-
         except ValueError:
             continue
-
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
-        picks.append({
-            "match_time": match_dt,
-            "player1": player1,
-            "player2": player2,
-            "pick": pick,
-            "alert_key": alert_key,
-        })
+        if alert_key not in seen_keys:
+            seen_keys.add(alert_key)
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+
+    for m in pattern2.finditer(text):
+        time_str = m.group(1).strip()
+        player1 = m.group(2).strip()
+        pick = m.group(3).strip()
+        player2 = m.group(4).strip()
+        try:
+            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
+            match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
+            if t.hour < 6:
+                if post_date == yesterday:
+                    next_day = post_date + timedelta(days=1)
+                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+                elif post_date == today and match_dt < now:
+                    next_day = today + timedelta(days=1)
+                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+        except ValueError:
+            continue
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
+        if alert_key not in seen_keys:
+            seen_keys.add(alert_key)
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+
     return picks
 
 
