@@ -116,6 +116,10 @@ async def db_cleanup_old_picks(session: aiohttp.ClientSession):
 
 def parse_picks(text: str, post_date: date) -> list[dict]:
     picks = []
+    now = EST_now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
     # Pattern 1: standard format - TIME Player1 vs Player2 PICK
     pattern1 = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
@@ -127,11 +131,27 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
     # Pattern 2: spread format - TIME Player1 -X.X spread vs Player2
     pattern2 = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
-        r"(\w+(?:\s+\w+)?)\s+"          # player1 (1-2 words)
-        r"(-\d+\.?\d*[^v]+?)\s+vs\s+"  # spread pick
-        r"(\w+(?:\s+\w+)?)(.*)$",       # player2
+        r"(\w+(?:\s+\w+)?)\s+"
+        r"(-\d+\.?\d*[^v]+?)\s+vs\s+"
+        r"(\w+(?:\s+\w+)?)(.*)$",
         re.IGNORECASE | re.MULTILINE,
     )
+
+    def resolve_match_dt(t, post_date):
+        match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
+        if t.hour < 6:
+            if post_date == yesterday:
+                # Overnight post — assign to today only if that time hasn't passed
+                candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
+                if candidate > now:
+                    return candidate
+                # Time already passed today, keep as yesterday's date
+                return match_dt
+            elif post_date == today and match_dt < now:
+                # Posted today, early morning time already passed — assign to tomorrow
+                next_day = today + timedelta(days=1)
+                return EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+        return match_dt
 
     seen_keys = set()
     for m in pattern1.finditer(text):
@@ -141,14 +161,7 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         pick = m.group(4).strip()
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
-            match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-            if t.hour < 6:
-                if post_date == yesterday:
-                    next_day = post_date + timedelta(days=1)
-                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
-                elif post_date == today and match_dt < now:
-                    next_day = today + timedelta(days=1)
-                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+            match_dt = resolve_match_dt(t, post_date)
         except ValueError:
             continue
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
@@ -163,14 +176,7 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         player2 = m.group(4).strip()
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
-            match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-            if t.hour < 6:
-                if post_date == yesterday:
-                    next_day = post_date + timedelta(days=1)
-                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
-                elif post_date == today and match_dt < now:
-                    next_day = today + timedelta(days=1)
-                    match_dt = EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+            match_dt = resolve_match_dt(t, post_date)
         except ValueError:
             continue
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
@@ -211,7 +217,7 @@ async def get_guild_id(session: aiohttp.ClientSession) -> str | None:
 
 
 async def get_channel_messages(session: aiohttp.ClientSession) -> list:
-    url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages?limit=20"
+    url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages?limit=50"
     async with session.get(url, headers=DISCORD_HEADERS) as r:
         if r.status != 200:
             print(f"⚠️ Failed to fetch messages: {r.status}")
@@ -277,6 +283,11 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
             effective_date = edit_dt.date()
         else:
             effective_date = post_date
+
+        # Stop reading once we hit messages older than yesterday
+        if post_date < yesterday and effective_date < yesterday:
+            print(f"⏹ Stopping at message from {post_date} — too old.")
+            break
 
         if post_date not in (today, yesterday) and effective_date not in (today, yesterday):
             continue
