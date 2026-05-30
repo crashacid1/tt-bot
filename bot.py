@@ -361,13 +361,18 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         })
 
         # Send DMs concurrently with a semaphore to avoid rate limits
-        semaphore = asyncio.Semaphore(10)  # 10 concurrent DMs at a time
+        semaphore = asyncio.Semaphore(5)  # 5 concurrent DMs at a time
 
         async def send_one(member, msg=alert_msg):
             async with semaphore:
                 user = member.get("user", {})
                 if not user.get("bot"):
-                    await send_dm(session, user["id"], msg)
+                    try:
+                        await asyncio.wait_for(send_dm(session, user["id"], msg), timeout=5)
+                    except asyncio.TimeoutError:
+                        print(f"⚠️ DM timeout for {user.get('username', 'unknown')}")
+                    except Exception as e:
+                        print(f"⚠️ DM error: {e}")
 
         await asyncio.gather(*[send_one(m) for m in real_members])
         print(f"✅ Alert sent to {len(real_members)} members.")
