@@ -359,13 +359,18 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
             "player2": row["player2"],
             "pick": row["pick"],
         })
-        count = 0
-        for member in real_members:
-            user = member.get("user", {})
-            await send_dm(session, user["id"], alert_msg)
-            count += 1
-            await asyncio.sleep(0.5)
-        print(f"✅ Alert sent to {count} members.")
+
+        # Send DMs concurrently with a semaphore to avoid rate limits
+        semaphore = asyncio.Semaphore(10)  # 10 concurrent DMs at a time
+
+        async def send_one(member, msg=alert_msg):
+            async with semaphore:
+                user = member.get("user", {})
+                if not user.get("bot"):
+                    await send_dm(session, user["id"], msg)
+
+        await asyncio.gather(*[send_one(m) for m in real_members])
+        print(f"✅ Alert sent to {len(real_members)} members.")
         await db_mark_alert_sent(session, row["alert_key"])
 
 
