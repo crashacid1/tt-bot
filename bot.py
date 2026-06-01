@@ -320,13 +320,14 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         else:
             effective_date = post_date
 
-        # Stop reading once we hit messages older than yesterday
-        if post_date < yesterday and effective_date < yesterday:
-            print(f"⏹ Stopping at message from {post_date} — too old.")
+        # Only process messages posted or edited in the last 36 hours
+        cutoff_utc = datetime.now(pytz.utc) - timedelta(hours=36)
+        post_dt_utc = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
+        edit_dt_utc = datetime.fromisoformat(msg["edited_timestamp"].replace("Z", "+00:00")) if msg.get("edited_timestamp") else None
+        most_recent_utc = edit_dt_utc if edit_dt_utc else post_dt_utc
+        if most_recent_utc < cutoff_utc:
+            print(f"⏹ Stopping — message too old.")
             break
-
-        if post_date not in (today, yesterday) and effective_date not in (today, yesterday):
-            continue
 
         content = msg.get("content", "")
         if not content.strip():
