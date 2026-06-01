@@ -27,7 +27,44 @@ SUPABASE_UPSERT_HEADERS = {
 }
 
 EST_now = lambda: datetime.now(EST)
-TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 second timeout on all requests
+TIMEOUT = aiohttp.ClientTimeout(total=10)
+RESULTS_CHANNEL_ID = "1466857650607100027"
+
+
+# ── Result parsing ────────────────────────────────────────────────────────────
+
+def count_emojis(text: str):
+    """Count ✅ and ❌ in a string."""
+    wins = text.count("✅")
+    losses = text.count("❌")
+    voids = text.count("💀")
+    return wins, losses, voids
+
+
+def calculate_units(pick_text: str) -> tuple[float, int]:
+    """
+    Returns (net_units, void_count) for a pick line.
+    Handles OVER, UNDER, SPLIT, SplitDD as separate components.
+    2U picks count double.
+    💀 = void.
+    """
+    is_2u = bool(re.search(r'\b2U\b', pick_text, re.IGNORECASE))
+    multiplier = 2 if is_2u else 1
+
+    # Split into components by + separator
+    components = re.split(r'\+', pick_text)
+    total_units = 0.0
+    total_voids = 0
+
+    for component in components:
+        wins, losses, voids = count_emojis(component)
+        if voids > 0 and wins == 0 and losses == 0:
+            total_voids += 1
+            continue
+        net = (wins - losses) * multiplier
+        total_units += net
+
+    return total_units, total_voids
 
 
 # ── Supabase helpers ─────────────────────────────────────────────────────────
@@ -379,6 +416,97 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         await db_mark_alert_sent(session, row["alert_key"])
 
 
+# ── Weekly report ─────────────────────────────────────────────────────────────
+
+async def fetch_week_picks(session: aiohttp.ClientSession, monday: date, sunday: date) -> list:
+    """Fetch all picks for the week from Supabase."""
+    url = (
+        f"{SUPABASE_URL}/rest/v1/picks"
+        f"?select=*"
+        f"&match_date=gte.{monday.isoformat()}"
+        f"&match_date=lte.{sunday.isoformat()}"
+        f"&order=match_time.asc"
+    )
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            print(f"⚠️ Failed to fetch week picks: {r.status}")
+            return []
+        return await r.json()
+
+
+async def post_weekly_report(session: aiohttp.ClientSession):
+    """Build and post the weekly performance report."""
+    now = EST_now()
+    # Get Monday of current week
+    monday = now.date() - timedelta(days=now.weekday())
+    sunday = monday + timedelta(days=6)
+
+    print(f"📊 Building weekly report for {monday} to {sunday}...")
+    picks = await fetch_week_picks(session, monday, sunday)
+
+    if not picks:
+        print("⚠️ No picks found for this week.")
+        return
+
+    total_units = 0.0
+    total_wins = 0
+    total_losses = 0
+    total_voids = 0
+    daily_units = {}
+
+    for pick in picks:
+        pick_text = pick.get("pick", "")
+        match_date = pick.get("match_date")
+
+        net, voids = calculate_units(pick_text)
+        wins, losses, _ = count_emojis(pick_text)
+
+        total_units += net
+        total_wins += wins
+        total_losses += losses
+        total_voids += voids
+
+        if match_date not in daily_units:
+            daily_units[match_date] = 0.0
+        daily_units[match_date] += net
+
+    total_picks = total_wins + total_losses
+    win_rate = (total_wins / total_picks * 100) if total_picks > 0 else 0
+
+    # Build report message
+    unit_sign = "+" if total_units >= 0 else ""
+    report = (
+        f"🏓 **WEEKLY PERFORMANCE REPORT**\n"
+        f"📅 {monday.strftime('%b %d')} — {sunday.strftime('%b %d, %Y')}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Wins: **{total_wins}**\n"
+        f"❌ Losses: **{total_losses}**\n"
+        f"💀 Voids: **{total_voids}**\n"
+        f"📊 Win Rate: **{win_rate:.1f}%**\n"
+        f"💰 Net Units: **{unit_sign}{total_units:.1f}U**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**Daily Breakdown:**\n"
+    )
+
+    for day_str in sorted(daily_units.keys()):
+        day_date = date.fromisoformat(day_str)
+        day_net = daily_units[day_str]
+        sign = "+" if day_net >= 0 else ""
+        emoji = "🟢" if day_net > 0 else "🔴" if day_net < 0 else "⚪"
+        report += f"{emoji} {day_date.strftime('%A %b %d')}: {sign}{day_net:.1f}U\n"
+
+    report += f"\n@everyone"
+
+    # Post to results channel
+    url = f"{DISCORD_API}/channels/{RESULTS_CHANNEL_ID}/messages"
+    async with session.post(url, headers=DISCORD_HEADERS, json={"content": report}) as r:
+        if r.status in (200, 201):
+            print(f"✅ Weekly report posted successfully.")
+        else:
+            text = await r.text()
+            print(f"⚠️ Failed to post weekly report: {r.status} {text}")
+
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 async def scanner_loop():
@@ -392,6 +520,7 @@ async def scanner_loop():
         print(f"✅ Connected to guild ID: {guild_id}")
 
         last_cleanup_date = None
+        weekly_report_sent = None  # tracks which Sunday we last sent the report
 
         while True:
             try:
@@ -402,6 +531,13 @@ async def scanner_loop():
                 if last_cleanup_date != today:
                     await db_cleanup_old_picks(session)
                     last_cleanup_date = today
+
+                # Weekly report — Sunday at 10:00pm EST
+                is_sunday = now_est.weekday() == 6
+                is_report_time = now_est.hour == 22 and now_est.minute < 1
+                if is_sunday and is_report_time and weekly_report_sent != today:
+                    await post_weekly_report(session)
+                    weekly_report_sent = today
 
                 # Wrap each cycle in a timeout so a freeze never lasts more than 30s
                 await asyncio.wait_for(
