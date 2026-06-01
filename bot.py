@@ -379,6 +379,11 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
         seconds_until = (match_dt - now_est).total_seconds()
         print(f"⏱ {row['player1']} vs {row['player2']} in {int(seconds_until)}s")
+        # Skip if match already started (negative seconds)
+        if seconds_until < 0:
+            print(f"⏭ Skipping {row['player1']} vs {row['player2']} — already started.")
+            await db_mark_alert_sent(session, row["alert_key"])
+            continue
         if 60 <= seconds_until <= 180:
             if row["alert_key"] not in alerts_in_progress:
                 alerts_to_send.append(row)
