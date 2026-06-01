@@ -87,7 +87,12 @@ async def db_get_existing_keys(session: aiohttp.ClientSession, today: date) -> d
 
 
 async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert a new pick."""
+    """Insert a new pick only if match time is within 24 hours in the past or in the future."""
+    now_utc = datetime.now(pytz.utc)
+    match_utc = pick["match_time"].astimezone(pytz.utc)
+    # Don't insert matches that happened more than 24 hours ago
+    if (now_utc - match_utc).total_seconds() > 86400:
+        return
     url = f"{SUPABASE_URL}/rest/v1/picks"
     payload = {
         "match_date": pick["match_time"].date().isoformat(),
