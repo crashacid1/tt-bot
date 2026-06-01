@@ -320,20 +320,18 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         else:
             effective_date = post_date
 
-        # Only process messages posted or edited in the last 36 hours
+        # Only process messages POSTED in the last 36 hours (ignore edit date for age check)
         cutoff_utc = datetime.now(pytz.utc) - timedelta(hours=36)
         post_dt_utc = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
-        edit_dt_utc = datetime.fromisoformat(msg["edited_timestamp"].replace("Z", "+00:00")) if msg.get("edited_timestamp") else None
-        most_recent_utc = edit_dt_utc if edit_dt_utc else post_dt_utc
-        if most_recent_utc < cutoff_utc:
-            print(f"⏹ Stopping — message too old.")
+        if post_dt_utc < cutoff_utc:
+            print(f"⏹ Stopping — message posted {((datetime.now(pytz.utc) - post_dt_utc).total_seconds()/3600):.0f}h ago, too old.")
             break
 
         content = msg.get("content", "")
         if not content.strip():
             continue
 
-        use_date = effective_date if effective_date in (today, yesterday) else post_date
+        use_date = post_date
         picks = parse_picks(content, use_date)
         print(f"📝 Message from {post_date} (effective: {effective_date}): {len(picks)} picks parsed.")
         all_picks.extend(picks)
