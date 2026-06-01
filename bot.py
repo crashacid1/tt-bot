@@ -87,10 +87,13 @@ async def db_get_existing_keys(session: aiohttp.ClientSession, today: date) -> d
 
 
 async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert a new pick only if match time is within 24 hours in the past or in the future."""
+    """Insert a new pick only if it doesn't already have a result emoji."""
+    # Skip picks that already have results — match already happened
+    pick_text = pick.get("pick", "")
+    if "✅" in pick_text or "❌" in pick_text or "💀" in pick_text:
+        return
     now_utc = datetime.now(pytz.utc)
     match_utc = pick["match_time"].astimezone(pytz.utc)
-    # Don't insert matches that happened more than 24 hours ago
     if (now_utc - match_utc).total_seconds() > 86400:
         return
     url = f"{SUPABASE_URL}/rest/v1/picks"
@@ -320,12 +323,13 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         else:
             effective_date = post_date
 
-        # Only process messages POSTED in the last 36 hours (ignore edit date for age check)
-        cutoff_utc = datetime.now(pytz.utc) - timedelta(hours=36)
-        post_dt_utc = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00"))
-        if post_dt_utc < cutoff_utc:
-            print(f"⏹ Stopping — message posted {((datetime.now(pytz.utc) - post_dt_utc).total_seconds()/3600):.0f}h ago, too old.")
+        # Only process messages posted today or yesterday (by post date, ignoring edits)
+        if post_date < yesterday:
+            print(f"⏹ Stopping — message posted on {post_date}, too old.")
             break
+
+        if post_date not in (today, yesterday):
+            continue
 
         content = msg.get("content", "")
         if not content.strip():
@@ -343,6 +347,10 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
     updates = 0
     for pick in all_picks:
         key = pick["alert_key"]
+        pick_text = pick.get("pick", "")
+        # Skip any pick that already has a result emoji
+        if "✅" in pick_text or "❌" in pick_text or "💀" in pick_text:
+            continue
         if key in existing:
             row = existing[key]
             if not row.get("alert_sent") and row.get("pick") != pick["pick"]:
