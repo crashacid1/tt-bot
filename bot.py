@@ -176,18 +176,12 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
 
     def resolve_match_dt(t, post_date):
         match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-        if t.hour < 6:
-            if post_date == yesterday:
-                # Overnight post — assign to today only if that time hasn't passed
-                candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
-                if candidate > now:
-                    return candidate
-                # Time already passed today, keep as yesterday's date
-                return match_dt
-            elif post_date == today and match_dt < now:
-                # Posted today, early morning time already passed — assign to tomorrow
-                next_day = today + timedelta(days=1)
-                return EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
+        if t.hour < 6 and post_date == yesterday:
+            # Message posted yesterday with early morning match — assign to today
+            # only if that time hasn't passed yet
+            candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
+            if candidate > now:
+                return candidate
         return match_dt
 
     seen_keys = set()
