@@ -384,7 +384,7 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
             print(f"⏭ Skipping {row['player1']} vs {row['player2']} — already started.")
             await db_mark_alert_sent(session, row["alert_key"])
             continue
-        if 60 <= seconds_until <= 180:
+        if 75 <= seconds_until <= 115:
             if row["alert_key"] not in alerts_in_progress:
                 alerts_to_send.append(row)
 
