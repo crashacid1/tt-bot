@@ -10,8 +10,9 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PICKS_CHANNEL_ID = "1466857635746808020"
+RESULTS_CHANNEL_ID = "1466857650607100027"
 EST = pytz.timezone("US/Eastern")
-CHECK_INTERVAL = 20  # seconds between scans
+CHECK_INTERVAL = 20
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_HEADERS = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
 SUPABASE_HEADERS = {
@@ -28,13 +29,11 @@ SUPABASE_UPSERT_HEADERS = {
 
 EST_now = lambda: datetime.now(EST)
 TIMEOUT = aiohttp.ClientTimeout(total=10)
-RESULTS_CHANNEL_ID = "1466857650607100027"
 
 
 # ── Result parsing ────────────────────────────────────────────────────────────
 
 def count_emojis(text: str):
-    """Count ✅ and ❌ in a string."""
     wins = text.count("✅")
     losses = text.count("❌")
     voids = text.count("💀")
@@ -42,20 +41,11 @@ def count_emojis(text: str):
 
 
 def calculate_units(pick_text: str) -> tuple[float, int]:
-    """
-    Returns (net_units, void_count) for a pick line.
-    Handles OVER, UNDER, SPLIT, SplitDD as separate components.
-    2U picks count double.
-    💀 = void.
-    """
     is_2u = bool(re.search(r'\b2U\b', pick_text, re.IGNORECASE))
     multiplier = 2 if is_2u else 1
-
-    # Split into components by + separator
     components = re.split(r'\+', pick_text)
     total_units = 0.0
     total_voids = 0
-
     for component in components:
         wins, losses, voids = count_emojis(component)
         if voids > 0 and wins == 0 and losses == 0:
@@ -63,14 +53,16 @@ def calculate_units(pick_text: str) -> tuple[float, int]:
             continue
         net = (wins - losses) * multiplier
         total_units += net
-
     return total_units, total_voids
 
 
-# ── Supabase helpers ─────────────────────────────────────────────────────────
+def has_result(pick_text: str) -> bool:
+    return "✅" in pick_text or "❌" in pick_text or "💀" in pick_text
+
+
+# ── Supabase — picks table ────────────────────────────────────────────────────
 
 async def db_get_existing_keys(session: aiohttp.ClientSession, today: date) -> dict:
-    """Fetch all existing picks for today and yesterday in one query. Returns {alert_key: {pick, alert_sent}}"""
     yesterday = today - timedelta(days=1)
     tomorrow = today + timedelta(days=1)
     url = (
@@ -87,10 +79,7 @@ async def db_get_existing_keys(session: aiohttp.ClientSession, today: date) -> d
 
 
 async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
-    """Insert a new pick only if it doesn't already have a result emoji."""
-    # Skip picks that already have results — match already happened
-    pick_text = pick.get("pick", "")
-    if "✅" in pick_text or "❌" in pick_text or "💀" in pick_text:
+    if has_result(pick.get("pick", "")):
         return
     now_utc = datetime.now(pytz.utc)
     match_utc = pick["match_time"].astimezone(pytz.utc)
@@ -113,7 +102,6 @@ async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
 
 
 async def db_update_pick(session: aiohttp.ClientSession, alert_key: str, new_pick: str):
-    """Update pick text for an existing pick."""
     url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
     async with session.patch(url, headers=SUPABASE_HEADERS, json={"pick": new_pick}) as r:
         if r.status in (200, 204):
@@ -153,8 +141,55 @@ async def db_cleanup_old_picks(session: aiohttp.ClientSession):
     async with session.delete(url, headers=SUPABASE_HEADERS) as r:
         if r.status in (200, 204):
             print(f"🧹 Old picks cleaned up.")
+
+
+# ── Supabase — results table ──────────────────────────────────────────────────
+
+async def db_get_existing_result_keys(session: aiohttp.ClientSession) -> set:
+    """Fetch all alert_keys already in the results table."""
+    url = f"{SUPABASE_URL}/rest/v1/results?select=alert_key"
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            return set()
+        rows = await r.json()
+        return {row["alert_key"] for row in rows}
+
+
+async def db_insert_result(session: aiohttp.ClientSession, pick: dict):
+    """Insert a completed pick into the results table."""
+    pick_text = pick.get("pick", "")
+    net_units, voids = calculate_units(pick_text)
+    wins, losses, _ = count_emojis(pick_text)
+    url = f"{SUPABASE_URL}/rest/v1/results"
+    payload = {
+        "match_date": pick["match_time"].date().isoformat() if hasattr(pick["match_time"], "date") else pick["match_date"],
+        "match_time": pick["match_time"].isoformat() if hasattr(pick["match_time"], "isoformat") else pick["match_time"],
+        "player1": pick["player1"],
+        "player2": pick["player2"],
+        "pick": pick_text,
+        "wins": wins,
+        "losses": losses,
+        "voids": voids,
+        "net_units": net_units,
+        "alert_key": pick["alert_key"],
+    }
+    async with session.post(url, headers=SUPABASE_UPSERT_HEADERS, json=payload) as r:
+        if r.status not in (200, 201):
+            text = await r.text()
+            print(f"⚠️ Results insert failed: {r.status} {text}")
         else:
-            print(f"⚠️ DB cleanup failed: {r.status}")
+            print(f"📝 Result saved: {pick['player1']} vs {pick['player2']} ({net_units:+.1f}U)")
+
+
+async def db_update_result(session: aiohttp.ClientSession, alert_key: str, pick_text: str):
+    """Update an existing result with new pick text (in case emojis were added later)."""
+    net_units, voids = calculate_units(pick_text)
+    wins, losses, _ = count_emojis(pick_text)
+    url = f"{SUPABASE_URL}/rest/v1/results?alert_key=eq.{alert_key}"
+    payload = {"pick": pick_text, "wins": wins, "losses": losses, "voids": voids, "net_units": net_units}
+    async with session.patch(url, headers=SUPABASE_HEADERS, json=payload) as r:
+        if r.status in (200, 204):
+            print(f"✏️ Result updated: {alert_key}")
 
 
 # ── Pick parsing ─────────────────────────────────────────────────────────────
@@ -165,7 +200,6 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
     today = now.date()
     yesterday = today - timedelta(days=1)
 
-    # Pattern 1: standard format - TIME Player1 vs Player2 PICK
     pattern1 = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
         r"(.+?)\s+vs\s+"
@@ -173,7 +207,6 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
         r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).*)$",
         re.IGNORECASE | re.MULTILINE,
     )
-    # Pattern 2: spread format - TIME Player1 -X.X spread vs Player2
     pattern2 = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
         r"(\w+(?:\s+\w+)?)\s+"
@@ -185,8 +218,6 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
     def resolve_match_dt(t, post_date):
         match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
         if t.hour < 6 and post_date == yesterday:
-            # Message posted yesterday with early morning match — assign to today
-            # only if that time hasn't passed yet
             candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
             if candidate > now:
                 return candidate
@@ -194,10 +225,7 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
 
     seen_keys = set()
     for m in pattern1.finditer(text):
-        time_str = m.group(1).strip()
-        player1 = m.group(2).strip()
-        player2 = m.group(3).strip()
-        pick = m.group(4).strip()
+        time_str, player1, player2, pick = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = resolve_match_dt(t, post_date)
@@ -209,10 +237,7 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
             picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
 
     for m in pattern2.finditer(text):
-        time_str = m.group(1).strip()
-        player1 = m.group(2).strip()
-        pick = m.group(3).strip()
-        player2 = m.group(4).strip()
+        time_str, player1, pick, player2 = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = resolve_match_dt(t, post_date)
@@ -233,14 +258,12 @@ def build_alert_message(pick: dict) -> str:
         match_dt = datetime.fromisoformat(pick["match_time"]).astimezone(EST)
     else:
         match_dt = pick["match_time"]
-    match_time_str = match_dt.strftime("%I:%M %p EDT")
-    match_date_str = match_dt.strftime("%A, %m/%d/%Y")
     return (
         f"🏓 **MATCH STARTING IN 90 SECONDS!**\n\n"
         f"{pick['player1']} vs {pick['player2']}\n"
         f"Pick: {pick['pick']}\n"
-        f"Date: {match_date_str}\n"
-        f"Time: {match_time_str}\n\n"
+        f"Date: {match_dt.strftime('%A, %m/%d/%Y')}\n"
+        f"Time: {match_dt.strftime('%I:%M %p EDT')}\n\n"
         f"Good luck! 🍀"
     )
 
@@ -249,7 +272,6 @@ async def get_guild_id(session: aiohttp.ClientSession) -> str | None:
     url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}"
     async with session.get(url, headers=DISCORD_HEADERS) as r:
         if r.status != 200:
-            print(f"⚠️ Failed to fetch channel info: {r.status}")
             return None
         data = await r.json()
         return data.get("guild_id")
@@ -259,7 +281,6 @@ async def get_channel_messages(session: aiohttp.ClientSession) -> list:
     url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages?limit=50"
     async with session.get(url, headers=DISCORD_HEADERS) as r:
         if r.status != 200:
-            print(f"⚠️ Failed to fetch messages: {r.status}")
             return []
         return await r.json()
 
@@ -293,9 +314,7 @@ async def send_dm(session: aiohttp.ClientSession, user_id: str, message: str):
                             json={"content": message}) as r:
         if r.status == 429:
             data = await r.json()
-            retry_after = data.get("retry_after", 1)
-            print(f"⏳ Rate limited, waiting {retry_after}s")
-            await asyncio.sleep(retry_after)
+            await asyncio.sleep(data.get("retry_after", 1))
 
 
 # ── Message sync ─────────────────────────────────────────────────────────────
@@ -305,9 +324,8 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
     today = EST_now().date()
     yesterday = today - timedelta(days=1)
 
-    # Fetch all existing keys in ONE query
-    existing = await db_get_existing_keys(session, today)
-    print(f"📦 {len(existing)} picks already in DB.")
+    existing_picks = await db_get_existing_keys(session, today)
+    existing_results = await db_get_existing_result_keys(session)
 
     all_picks = []
     for msg in messages:
@@ -317,13 +335,7 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
         post_date = post_dt.date()
 
-        if msg.get("edited_timestamp"):
-            edit_dt = datetime.fromisoformat(msg["edited_timestamp"].replace("Z", "+00:00")).astimezone(EST)
-            effective_date = edit_dt.date()
-        else:
-            effective_date = post_date
-
-        # Only process messages posted today or yesterday (by post date, ignoring edits)
+        # Only process messages posted today or yesterday
         if post_date < yesterday:
             print(f"⏹ Stopping — message posted on {post_date}, too old.")
             break
@@ -335,42 +347,48 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         if not content.strip():
             continue
 
-        use_date = post_date
-        picks = parse_picks(content, use_date)
-        print(f"📝 Message from {post_date} (effective: {effective_date}): {len(picks)} picks parsed.")
+        picks = parse_picks(content, post_date)
+        print(f"📝 Message from {post_date}: {len(picks)} picks parsed.")
         all_picks.extend(picks)
 
-    print(f"🔎 Total picks parsed from channel: {len(all_picks)}")
-
-    # Now insert/update in minimal API calls
     inserts = 0
     updates = 0
+    results_saved = 0
+
     for pick in all_picks:
         key = pick["alert_key"]
         pick_text = pick.get("pick", "")
-        # Skip any pick that already has a result emoji
-        if "✅" in pick_text or "❌" in pick_text or "💀" in pick_text:
+
+        # If pick has result emojis — save to results table
+        if has_result(pick_text):
+            if key not in existing_results:
+                await db_insert_result(session, pick)
+                results_saved += 1
+            else:
+                # Update result in case more emojis were added
+                await db_update_result(session, key, pick_text)
             continue
-        if key in existing:
-            row = existing[key]
-            if not row.get("alert_sent") and row.get("pick") != pick["pick"]:
-                await db_update_pick(session, key, pick["pick"])
+
+        # No result yet — handle picks table
+        if key in existing_picks:
+            row = existing_picks[key]
+            if not row.get("alert_sent") and row.get("pick") != pick_text:
+                await db_update_pick(session, key, pick_text)
                 updates += 1
         else:
             await db_insert_pick(session, pick)
             inserts += 1
 
-    if inserts or updates:
-        print(f"💾 Synced: {inserts} new, {updates} updated.")
+    if inserts or updates or results_saved:
+        print(f"💾 Synced: {inserts} new picks, {updates} updated, {results_saved} results saved.")
     else:
         print(f"✅ No new picks to sync.")
 
 
-# In-memory set to prevent duplicate alerts within the same session
+# ── Alert sender ─────────────────────────────────────────────────────────────
+
 alerts_in_progress: set = set()
 
-
-# ── Alert sender ─────────────────────────────────────────────────────────────
 
 async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: list, now_est: datetime):
     global alerts_in_progress
@@ -379,19 +397,17 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
         seconds_until = (match_dt - now_est).total_seconds()
         print(f"⏱ {row['player1']} vs {row['player2']} in {int(seconds_until)}s")
-        # Skip if match already started (negative seconds)
         if seconds_until < 0:
             print(f"⏭ Skipping {row['player1']} vs {row['player2']} — already started.")
             await db_mark_alert_sent(session, row["alert_key"])
             continue
-        if 75 <= seconds_until <= 115:
+        if 90 <= seconds_until <= 120:
             if row["alert_key"] not in alerts_in_progress:
                 alerts_to_send.append(row)
 
     if not alerts_to_send:
         return
 
-    # Mark as in-progress immediately to prevent duplicate sends
     for row in alerts_to_send:
         alerts_in_progress.add(row["alert_key"])
 
@@ -408,8 +424,7 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
             "pick": row["pick"],
         })
 
-        # Send DMs concurrently with a semaphore to avoid rate limits
-        semaphore = asyncio.Semaphore(5)  # 5 concurrent DMs at a time
+        semaphore = asyncio.Semaphore(5)
 
         async def send_one(member, msg=alert_msg):
             async with semaphore:
@@ -418,9 +433,9 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
                     try:
                         await asyncio.wait_for(send_dm(session, user["id"], msg), timeout=5)
                     except asyncio.TimeoutError:
-                        print(f"⚠️ DM timeout for {user.get('username', 'unknown')}")
-                    except Exception as e:
-                        print(f"⚠️ DM error: {e}")
+                        pass
+                    except Exception:
+                        pass
 
         await asyncio.gather(*[send_one(m) for m in real_members])
         print(f"✅ Alert sent to {len(real_members)} members.")
@@ -429,10 +444,9 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
 
 # ── Weekly report ─────────────────────────────────────────────────────────────
 
-async def fetch_week_picks(session: aiohttp.ClientSession, monday: date, sunday: date) -> list:
-    """Fetch all picks for the week from Supabase."""
+async def fetch_week_results(session: aiohttp.ClientSession, monday: date, sunday: date) -> list:
     url = (
-        f"{SUPABASE_URL}/rest/v1/picks"
+        f"{SUPABASE_URL}/rest/v1/results"
         f"?select=*"
         f"&match_date=gte.{monday.isoformat()}"
         f"&match_date=lte.{sunday.isoformat()}"
@@ -440,23 +454,21 @@ async def fetch_week_picks(session: aiohttp.ClientSession, monday: date, sunday:
     )
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
-            print(f"⚠️ Failed to fetch week picks: {r.status}")
+            print(f"⚠️ Failed to fetch week results: {r.status}")
             return []
         return await r.json()
 
 
 async def post_weekly_report(session: aiohttp.ClientSession):
-    """Build and post the weekly performance report."""
     now = EST_now()
-    # Get Monday of current week
     monday = now.date() - timedelta(days=now.weekday())
     sunday = monday + timedelta(days=6)
 
     print(f"📊 Building weekly report for {monday} to {sunday}...")
-    picks = await fetch_week_picks(session, monday, sunday)
+    results = await fetch_week_results(session, monday, sunday)
 
-    if not picks:
-        print("⚠️ No picks found for this week.")
+    if not results:
+        print("⚠️ No results found for this week.")
         return
 
     total_units = 0.0
@@ -465,12 +477,12 @@ async def post_weekly_report(session: aiohttp.ClientSession):
     total_voids = 0
     daily_units = {}
 
-    for pick in picks:
-        pick_text = pick.get("pick", "")
-        match_date = pick.get("match_date")
-
-        net, voids = calculate_units(pick_text)
-        wins, losses, _ = count_emojis(pick_text)
+    for row in results:
+        net = float(row.get("net_units", 0))
+        wins = int(row.get("wins", 0))
+        losses = int(row.get("losses", 0))
+        voids = int(row.get("voids", 0))
+        match_date = row.get("match_date")
 
         total_units += net
         total_wins += wins
@@ -483,9 +495,8 @@ async def post_weekly_report(session: aiohttp.ClientSession):
 
     total_picks = total_wins + total_losses
     win_rate = (total_wins / total_picks * 100) if total_picks > 0 else 0
-
-    # Build report message
     unit_sign = "+" if total_units >= 0 else ""
+
     report = (
         f"🏓 **WEEKLY PERFORMANCE REPORT**\n"
         f"📅 {monday.strftime('%b %d')} — {sunday.strftime('%b %d, %Y')}\n\n"
@@ -508,7 +519,6 @@ async def post_weekly_report(session: aiohttp.ClientSession):
 
     report += f"\n@everyone"
 
-    # Post to results channel
     url = f"{DISCORD_API}/channels/{RESULTS_CHANNEL_ID}/messages"
     async with session.post(url, headers=DISCORD_HEADERS, json={"content": report}) as r:
         if r.status in (200, 201):
@@ -526,12 +536,12 @@ async def scanner_loop():
     async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
         guild_id = await get_guild_id(session)
         if guild_id is None:
-            print("❌ Could not get guild ID. Check token and channel ID.")
+            print("❌ Could not get guild ID.")
             return
         print(f"✅ Connected to guild ID: {guild_id}")
 
         last_cleanup_date = None
-        weekly_report_sent = None  # tracks which Sunday we last sent the report
+        weekly_report_sent = None
 
         while True:
             try:
@@ -543,18 +553,14 @@ async def scanner_loop():
                     await db_cleanup_old_picks(session)
                     last_cleanup_date = today
 
-                # Weekly report — Sunday at 10:00pm EST
                 is_sunday = now_est.weekday() == 6
                 is_report_time = now_est.hour == 22 and now_est.minute < 1
                 if is_sunday and is_report_time and weekly_report_sent != today:
                     await post_weekly_report(session)
                     weekly_report_sent = today
 
-                # Wrap each cycle in a timeout so a freeze never lasts more than 30s
                 await asyncio.wait_for(
-                    asyncio.gather(
-                        sync_picks_from_channel(session),
-                    ),
+                    sync_picks_from_channel(session),
                     timeout=30
                 )
 
