@@ -259,7 +259,7 @@ def build_alert_message(pick: dict) -> str:
     else:
         match_dt = pick["match_time"]
     return (
-        f"🏓 **MATCH STARTING IN 90 SECONDS!**\n\n"
+        f"🏓 **MATCH STARTING IN 60 SECONDS!**\n\n"
         f"{pick['player1']} vs {pick['player2']}\n"
         f"Pick: {pick['pick']}\n"
         f"Date: {match_dt.strftime('%A, %m/%d/%Y')}\n"
@@ -401,7 +401,7 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
             print(f"⏭ Skipping {row['player1']} vs {row['player2']} — already started.")
             await db_mark_alert_sent(session, row["alert_key"])
             continue
-        if 90 <= seconds_until <= 120:
+        if 50 <= seconds_until <= 70:
             if row["alert_key"] not in alerts_in_progress:
                 alerts_to_send.append(row)
 
