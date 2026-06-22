@@ -461,11 +461,12 @@ async def fetch_week_results(session: aiohttp.ClientSession, monday: date, sunda
 
 async def post_weekly_report(session: aiohttp.ClientSession):
     now = EST_now()
-    monday = now.date() - timedelta(days=now.weekday())
-    sunday = monday + timedelta(days=6)
+    # Since report runs Monday morning, get the previous week (Mon-Sun)
+    last_monday = now.date() - timedelta(days=7)
+    last_sunday = last_monday + timedelta(days=6)
 
-    print(f"📊 Building weekly report for {monday} to {sunday}...")
-    results = await fetch_week_results(session, monday, sunday)
+    print(f"📊 Building weekly report for {last_monday} to {last_sunday}...")
+    results = await fetch_week_results(session, last_monday, last_sunday)
 
     if not results:
         print("⚠️ No results found for this week.")
@@ -499,7 +500,7 @@ async def post_weekly_report(session: aiohttp.ClientSession):
 
     report = (
         f"🏓 **WEEKLY PERFORMANCE REPORT**\n"
-        f"📅 {monday.strftime('%b %d')} — {sunday.strftime('%b %d, %Y')}\n\n"
+        f"📅 {last_monday.strftime('%b %d')} — {last_sunday.strftime('%b %d, %Y')}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ Wins: **{total_wins}**\n"
         f"❌ Losses: **{total_losses}**\n"
@@ -528,7 +529,112 @@ async def post_weekly_report(session: aiohttp.ClientSession):
             print(f"⚠️ Failed to post weekly report: {r.status} {text}")
 
 
-# ── Main loop ────────────────────────────────────────────────────────────────
+# ── Nightly results sync ──────────────────────────────────────────────────────
+
+async def nightly_results_sync(session: aiohttp.ClientSession):
+    """Read all messages from today and yesterday, save completed picks to results table."""
+    print("🌙 Running nightly results sync...")
+    messages = await get_channel_messages(session)
+    today = EST_now().date()
+    yesterday = today - timedelta(days=1)
+
+    existing_results = await db_get_existing_result_keys(session)
+    saved = 0
+    updated = 0
+
+    for msg in messages:
+        if msg.get("author", {}).get("bot"):
+            continue
+
+        post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
+        post_date = post_dt.date()
+
+        if post_date < yesterday:
+            break
+
+        if post_date not in (today, yesterday):
+            continue
+
+        content = msg.get("content", "")
+        if not content.strip():
+            continue
+
+        # Parse ALL picks including those with result emojis
+        picks = parse_picks_with_results(content, post_date)
+
+        for pick in picks:
+            if not has_result(pick.get("pick", "")):
+                continue  # Skip picks without results
+            key = pick["alert_key"]
+            if key not in existing_results:
+                await db_insert_result(session, pick)
+                saved += 1
+            else:
+                await db_update_result(session, key, pick["pick"])
+                updated += 1
+
+    print(f"🌙 Nightly sync complete: {saved} new results, {updated} updated.")
+
+
+def parse_picks_with_results(text: str, post_date: date) -> list[dict]:
+    """Same as parse_picks but also includes picks with result emojis."""
+    picks = []
+    now = EST_now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    pattern1 = re.compile(
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
+        r"(.+?)\s+vs\s+"
+        r"(.+?)\s+"
+        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).*)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    pattern2 = re.compile(
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
+        r"(\w+(?:\s+\w+)?)\s+"
+        r"(-\d+\.?\d*[^v]+?)\s+vs\s+"
+        r"(\w+(?:\s+\w+)?)(.*)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def resolve_match_dt(t, post_date):
+        match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
+        if t.hour < 6 and post_date == yesterday:
+            candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
+            if candidate > now:
+                return candidate
+        return match_dt
+
+    seen_keys = set()
+    for m in pattern1.finditer(text):
+        time_str, player1, player2, pick = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+        try:
+            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
+            match_dt = resolve_match_dt(t, post_date)
+        except ValueError:
+            continue
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
+        if alert_key not in seen_keys:
+            seen_keys.add(alert_key)
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+
+    for m in pattern2.finditer(text):
+        time_str, player1, pick, player2 = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+        try:
+            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
+            match_dt = resolve_match_dt(t, post_date)
+        except ValueError:
+            continue
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
+        if alert_key not in seen_keys:
+            seen_keys.add(alert_key)
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+
+    return picks
+
+
+
 
 async def scanner_loop():
     print("🤖 TT Bot starting...")
@@ -542,20 +648,29 @@ async def scanner_loop():
 
         last_cleanup_date = None
         weekly_report_sent = None
+        nightly_sync_done = None
 
         while True:
             try:
                 now_est = EST_now()
                 today = now_est.date()
+                is_sunday = now_est.weekday() == 6
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
 
                 if last_cleanup_date != today:
                     await db_cleanup_old_picks(session)
                     last_cleanup_date = today
 
-                is_sunday = now_est.weekday() == 6
-                is_report_time = now_est.hour == 22 and now_est.minute < 1
-                if is_sunday and is_report_time and weekly_report_sent != today:
+                # Nightly results sync — 11:30pm EST every day including Sundays
+                is_nightly_time = now_est.hour == 23 and now_est.minute == 30
+                if is_nightly_time and nightly_sync_done != today:
+                    await nightly_results_sync(session)
+                    nightly_sync_done = today
+
+                # Weekly report — Monday at 8:00am EST
+                is_monday = now_est.weekday() == 0
+                is_report_time = now_est.hour == 8 and now_est.minute < 1
+                if is_monday and is_report_time and weekly_report_sent != today:
                     await post_weekly_report(session)
                     weekly_report_sent = today
 
