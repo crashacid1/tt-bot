@@ -31,29 +31,33 @@ EST_now = lambda: datetime.now(EST)
 TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
-# ── Result parsing ────────────────────────────────────────────────────────────
+# ── Result calculation ────────────────────────────────────────────────────────
 
-def count_emojis(text: str):
-    wins = text.count("✅")
-    losses = text.count("❌")
-    voids = text.count("💀")
-    return wins, losses, voids
-
-
-def calculate_units(pick_text: str) -> tuple[float, int]:
-    is_2u = bool(re.search(r'\b2U\b', pick_text, re.IGNORECASE))
-    multiplier = 2 if is_2u else 1
-    components = re.split(r'\+', pick_text)
-    total_units = 0.0
+def calculate_result(pick_text: str) -> tuple[int, int, int, float]:
+    """
+    Count wins, losses, voids and net units from pick text.
+    Rule: each ✅ = +1U, each ❌ = -1U, each 💀 = void (0U)
+    Emojis already reflect correct unit amounts (2U picks show ✅✅ etc.)
+    Voids: a 💀 with no ✅ or ❌ in the same component = void
+    """
+    # Split by + or AND to get components
+    components = re.split(r'\s+(?:AND|\+)\s+', pick_text, flags=re.IGNORECASE)
+    total_wins = 0
+    total_losses = 0
     total_voids = 0
+
     for component in components:
-        wins, losses, voids = count_emojis(component)
-        if voids > 0 and wins == 0 and losses == 0:
-            total_voids += 1
-            continue
-        net = (wins - losses) * multiplier
-        total_units += net
-    return total_units, total_voids
+        w = component.count("✅")
+        l = component.count("❌")
+        v = component.count("💀")
+        if v > 0 and w == 0 and l == 0:
+            total_voids += v
+        else:
+            total_wins += w
+            total_losses += l
+
+    net_units = float(total_wins - total_losses)
+    return total_wins, total_losses, total_voids, net_units
 
 
 def has_result(pick_text: str) -> bool:
@@ -145,9 +149,14 @@ async def db_cleanup_old_picks(session: aiohttp.ClientSession):
 
 # ── Supabase — results table ──────────────────────────────────────────────────
 
-async def db_get_existing_result_keys(session: aiohttp.ClientSession) -> set:
-    """Fetch all alert_keys already in the results table."""
-    url = f"{SUPABASE_URL}/rest/v1/results?select=alert_key"
+async def db_get_existing_result_keys(session: aiohttp.ClientSession, from_date: date) -> set:
+    """Fetch alert_keys from results table for the past 7 days."""
+    week_ago = from_date - timedelta(days=7)
+    url = (
+        f"{SUPABASE_URL}/rest/v1/results"
+        f"?select=alert_key"
+        f"&match_date=gte.{week_ago.isoformat()}"
+    )
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
             return set()
@@ -158,8 +167,7 @@ async def db_get_existing_result_keys(session: aiohttp.ClientSession) -> set:
 async def db_insert_result(session: aiohttp.ClientSession, pick: dict):
     """Insert a completed pick into the results table."""
     pick_text = pick.get("pick", "")
-    net_units, voids = calculate_units(pick_text)
-    wins, losses, _ = count_emojis(pick_text)
+    wins, losses, voids, net_units = calculate_result(pick_text)
     url = f"{SUPABASE_URL}/rest/v1/results"
     payload = {
         "match_date": pick["match_time"].date().isoformat() if hasattr(pick["match_time"], "date") else pick["match_date"],
@@ -182,9 +190,8 @@ async def db_insert_result(session: aiohttp.ClientSession, pick: dict):
 
 
 async def db_update_result(session: aiohttp.ClientSession, alert_key: str, pick_text: str):
-    """Update an existing result with new pick text (in case emojis were added later)."""
-    net_units, voids = calculate_units(pick_text)
-    wins, losses, _ = count_emojis(pick_text)
+    """Update an existing result with new pick text."""
+    wins, losses, voids, net_units = calculate_result(pick_text)
     url = f"{SUPABASE_URL}/rest/v1/results?alert_key=eq.{alert_key}"
     payload = {"pick": pick_text, "wins": wins, "losses": losses, "voids": voids, "net_units": net_units}
     async with session.patch(url, headers=SUPABASE_HEADERS, json=payload) as r:
@@ -195,6 +202,7 @@ async def db_update_result(session: aiohttp.ClientSession, alert_key: str, pick_
 # ── Pick parsing ─────────────────────────────────────────────────────────────
 
 def parse_picks(text: str, post_date: date) -> list[dict]:
+    """Parse picks WITHOUT result emojis for alerts."""
     picks = []
     now = EST_now()
     today = now.date()
@@ -221,6 +229,68 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
             candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
             if candidate > now:
                 return candidate
+        return match_dt
+
+    seen_keys = set()
+    for m in pattern1.finditer(text):
+        time_str, player1, player2, pick = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+        if has_result(pick):
+            continue  # Skip picks with result emojis for alerts
+        try:
+            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
+            match_dt = resolve_match_dt(t, post_date)
+        except ValueError:
+            continue
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
+        if alert_key not in seen_keys:
+            seen_keys.add(alert_key)
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+
+    for m in pattern2.finditer(text):
+        time_str, player1, pick, player2 = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+        if has_result(pick):
+            continue
+        try:
+            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
+            match_dt = resolve_match_dt(t, post_date)
+        except ValueError:
+            continue
+        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
+        if alert_key not in seen_keys:
+            seen_keys.add(alert_key)
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+
+    return picks
+
+
+def parse_picks_with_results(text: str, post_date: date) -> list[dict]:
+    """Parse ALL picks including those with result emojis for nightly sync."""
+    picks = []
+    now = EST_now()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+
+    pattern1 = re.compile(
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
+        r"(.+?)\s+vs\s+"
+        r"(.+?)\s+"
+        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).*)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    pattern2 = re.compile(
+        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
+        r"(\w+(?:\s+\w+)?)\s+"
+        r"(-\d+\.?\d*[^v]+?)\s+vs\s+"
+        r"(\w+(?:\s+\w+)?)(.*)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def resolve_match_dt(t, post_date):
+        match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
+        if t.hour < 6 and post_date == yesterday:
+            # For nightly sync always push early morning to next day
+            next_day = post_date + timedelta(days=1)
+            return EST.localize(datetime(next_day.year, next_day.month, next_day.day, t.hour, t.minute))
         return match_dt
 
     seen_keys = set()
@@ -325,28 +395,22 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
     yesterday = today - timedelta(days=1)
 
     existing_picks = await db_get_existing_keys(session, today)
-    existing_results = await db_get_existing_result_keys(session)
+    existing_results = await db_get_existing_result_keys(session, today)
 
     all_picks = []
     for msg in messages:
         if msg.get("author", {}).get("bot"):
             continue
-
         post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
         post_date = post_dt.date()
-
-        # Only process messages posted today or yesterday
         if post_date < yesterday:
             print(f"⏹ Stopping — message posted on {post_date}, too old.")
             break
-
         if post_date not in (today, yesterday):
             continue
-
         content = msg.get("content", "")
         if not content.strip():
             continue
-
         picks = parse_picks(content, post_date)
         print(f"📝 Message from {post_date}: {len(picks)} picks parsed.")
         all_picks.extend(picks)
@@ -359,17 +423,14 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         key = pick["alert_key"]
         pick_text = pick.get("pick", "")
 
-        # If pick has result emojis — save to results table
         if has_result(pick_text):
             if key not in existing_results:
                 await db_insert_result(session, pick)
                 results_saved += 1
             else:
-                # Update result in case more emojis were added
                 await db_update_result(session, key, pick_text)
             continue
 
-        # No result yet — handle picks table
         if key in existing_picks:
             row = existing_picks[key]
             if not row.get("alert_sent") and row.get("pick") != pick_text:
@@ -442,6 +503,47 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         await db_mark_alert_sent(session, row["alert_key"])
 
 
+# ── Nightly results sync ──────────────────────────────────────────────────────
+
+async def nightly_results_sync(session: aiohttp.ClientSession):
+    print("🌙 Running nightly results sync...")
+    messages = await get_channel_messages(session)
+    today = EST_now().date()
+    yesterday = today - timedelta(days=1)
+
+    existing_results = await db_get_existing_result_keys(session, today)
+    saved = 0
+    updated = 0
+
+    for msg in messages:
+        if msg.get("author", {}).get("bot"):
+            continue
+        post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
+        post_date = post_dt.date()
+        if post_date < yesterday:
+            break
+        if post_date not in (today, yesterday):
+            continue
+        content = msg.get("content", "")
+        if not content.strip():
+            continue
+
+        picks = parse_picks_with_results(content, post_date)
+
+        for pick in picks:
+            if not has_result(pick.get("pick", "")):
+                continue
+            key = pick["alert_key"]
+            if key not in existing_results:
+                await db_insert_result(session, pick)
+                saved += 1
+            else:
+                await db_update_result(session, key, pick["pick"])
+                updated += 1
+
+    print(f"🌙 Nightly sync complete: {saved} new results, {updated} updated.")
+
+
 # ── Weekly report ─────────────────────────────────────────────────────────────
 
 async def fetch_week_results(session: aiohttp.ClientSession, monday: date, sunday: date) -> list:
@@ -451,6 +553,7 @@ async def fetch_week_results(session: aiohttp.ClientSession, monday: date, sunda
         f"&match_date=gte.{monday.isoformat()}"
         f"&match_date=lte.{sunday.isoformat()}"
         f"&order=match_time.asc"
+        f"&limit=1000"
     )
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
@@ -461,7 +564,6 @@ async def fetch_week_results(session: aiohttp.ClientSession, monday: date, sunda
 
 async def post_weekly_report(session: aiohttp.ClientSession):
     now = EST_now()
-    # Since report runs Monday morning, get the previous week (Mon-Sun)
     last_monday = now.date() - timedelta(days=7)
     last_sunday = last_monday + timedelta(days=6)
 
@@ -472,10 +574,8 @@ async def post_weekly_report(session: aiohttp.ClientSession):
         print("⚠️ No results found for this week.")
         return
 
+    total_wins = total_losses = total_voids = 0
     total_units = 0.0
-    total_wins = 0
-    total_losses = 0
-    total_voids = 0
     daily_units = {}
 
     for row in results:
@@ -529,112 +629,7 @@ async def post_weekly_report(session: aiohttp.ClientSession):
             print(f"⚠️ Failed to post weekly report: {r.status} {text}")
 
 
-# ── Nightly results sync ──────────────────────────────────────────────────────
-
-async def nightly_results_sync(session: aiohttp.ClientSession):
-    """Read all messages from today and yesterday, save completed picks to results table."""
-    print("🌙 Running nightly results sync...")
-    messages = await get_channel_messages(session)
-    today = EST_now().date()
-    yesterday = today - timedelta(days=1)
-
-    existing_results = await db_get_existing_result_keys(session)
-    saved = 0
-    updated = 0
-
-    for msg in messages:
-        if msg.get("author", {}).get("bot"):
-            continue
-
-        post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
-        post_date = post_dt.date()
-
-        if post_date < yesterday:
-            break
-
-        if post_date not in (today, yesterday):
-            continue
-
-        content = msg.get("content", "")
-        if not content.strip():
-            continue
-
-        # Parse ALL picks including those with result emojis
-        picks = parse_picks_with_results(content, post_date)
-
-        for pick in picks:
-            if not has_result(pick.get("pick", "")):
-                continue  # Skip picks without results
-            key = pick["alert_key"]
-            if key not in existing_results:
-                await db_insert_result(session, pick)
-                saved += 1
-            else:
-                await db_update_result(session, key, pick["pick"])
-                updated += 1
-
-    print(f"🌙 Nightly sync complete: {saved} new results, {updated} updated.")
-
-
-def parse_picks_with_results(text: str, post_date: date) -> list[dict]:
-    """Same as parse_picks but also includes picks with result emojis."""
-    picks = []
-    now = EST_now()
-    today = now.date()
-    yesterday = today - timedelta(days=1)
-
-    pattern1 = re.compile(
-        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
-        r"(.+?)\s+vs\s+"
-        r"(.+?)\s+"
-        r"((?:OVER|UNDER|SPLIT|SplitDD|Split\s+DD|\w+\s+-\d+\.?\d*).*)$",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    pattern2 = re.compile(
-        r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
-        r"(\w+(?:\s+\w+)?)\s+"
-        r"(-\d+\.?\d*[^v]+?)\s+vs\s+"
-        r"(\w+(?:\s+\w+)?)(.*)$",
-        re.IGNORECASE | re.MULTILINE,
-    )
-
-    def resolve_match_dt(t, post_date):
-        match_dt = EST.localize(datetime(post_date.year, post_date.month, post_date.day, t.hour, t.minute))
-        if t.hour < 6 and post_date == yesterday:
-            candidate = EST.localize(datetime(today.year, today.month, today.day, t.hour, t.minute))
-            if candidate > now:
-                return candidate
-        return match_dt
-
-    seen_keys = set()
-    for m in pattern1.finditer(text):
-        time_str, player1, player2, pick = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
-        try:
-            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
-            match_dt = resolve_match_dt(t, post_date)
-        except ValueError:
-            continue
-        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
-        if alert_key not in seen_keys:
-            seen_keys.add(alert_key)
-            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
-
-    for m in pattern2.finditer(text):
-        time_str, player1, pick, player2 = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
-        try:
-            t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
-            match_dt = resolve_match_dt(t, post_date)
-        except ValueError:
-            continue
-        alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
-        if alert_key not in seen_keys:
-            seen_keys.add(alert_key)
-            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
-
-    return picks
-
-
-
+# ── Main loop ────────────────────────────────────────────────────────────────
 
 async def scanner_loop():
     print("🤖 TT Bot starting...")
@@ -654,21 +649,20 @@ async def scanner_loop():
             try:
                 now_est = EST_now()
                 today = now_est.date()
-                is_sunday = now_est.weekday() == 6
+                is_monday = now_est.weekday() == 0
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
 
                 if last_cleanup_date != today:
                     await db_cleanup_old_picks(session)
                     last_cleanup_date = today
 
-                # Nightly results sync — 11:30pm EST every day including Sundays
+                # Nightly results sync — 11:30pm EST every day
                 is_nightly_time = now_est.hour == 23 and now_est.minute == 30
                 if is_nightly_time and nightly_sync_done != today:
                     await nightly_results_sync(session)
                     nightly_sync_done = today
 
                 # Weekly report — Monday at 8:00am EST
-                is_monday = now_est.weekday() == 0
                 is_report_time = now_est.hour == 8 and now_est.minute < 1
                 if is_monday and is_report_time and weekly_report_sent != today:
                     await post_weekly_report(session)
