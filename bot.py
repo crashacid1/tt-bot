@@ -30,6 +30,12 @@ SUPABASE_UPSERT_HEADERS = {
 EST_now = lambda: datetime.now(EST)
 TIMEOUT = aiohttp.ClientTimeout(total=10)
 
+# Only these roles receive TT alerts
+ALERT_ROLE_IDS = {
+    "1535761278151172216",  # TT_Premium
+    "1486190812915175465",  # Admin
+}
+
 
 # ── Result calculation ────────────────────────────────────────────────────────
 
@@ -473,7 +479,12 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         alerts_in_progress.add(row["alert_key"])
 
     members = await get_guild_members(session, guild_id)
-    real_members = [m for m in members if not m.get("user", {}).get("bot")]
+    real_members = [
+        m for m in members
+        if not m.get("user", {}).get("bot")
+        and any(role_id in ALERT_ROLE_IDS for role_id in m.get("roles", []))
+    ]
+    print(f"📨 Sending to {len(real_members)} eligible members.")
 
     for row in alerts_to_send:
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
