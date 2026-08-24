@@ -877,7 +877,12 @@ async def scanner_loop():
             await asyncio.sleep(CHECK_INTERVAL)
 
 
-asyncio.run(asyncio.gather(
-    scanner_loop(),
-    gateway_listener(aiohttp.ClientSession(timeout=TIMEOUT))
-))
+async def main():
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as gateway_session:
+        await asyncio.gather(
+            scanner_loop(),
+            gateway_listener(gateway_session)
+        )
+
+
+asyncio.run(main())
