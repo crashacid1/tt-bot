@@ -586,28 +586,24 @@ async def post_weekly_report(session: aiohttp.ClientSession):
         return
 
     total_wins = total_losses = total_voids = 0
-    total_units = 0.0
-    daily_units = {}
+    daily = {}
 
     for row in results:
-        net = float(row.get("net_units", 0))
         wins = int(row.get("wins", 0))
         losses = int(row.get("losses", 0))
         voids = int(row.get("voids", 0))
         match_date = row.get("match_date")
 
-        total_units += net
         total_wins += wins
         total_losses += losses
         total_voids += voids
 
-        if match_date not in daily_units:
-            daily_units[match_date] = 0.0
-        daily_units[match_date] += net
+        if match_date not in daily:
+            daily[match_date] = 0
+        daily[match_date] += wins - losses
 
-    total_picks = total_wins + total_losses
-    win_rate = (total_wins / total_picks * 100) if total_picks > 0 else 0
-    unit_sign = "+" if total_units >= 0 else ""
+    week_total = total_wins - total_losses
+    sign = "+" if week_total >= 0 else ""
 
     report = (
         f"🏓 **WEEKLY PERFORMANCE REPORT**\n"
@@ -616,18 +612,17 @@ async def post_weekly_report(session: aiohttp.ClientSession):
         f"✅ Wins: **{total_wins}**\n"
         f"❌ Losses: **{total_losses}**\n"
         f"💀 Voids: **{total_voids}**\n"
-        f"📊 Win Rate: **{win_rate:.1f}%**\n"
-        f"💰 Net Units: **{unit_sign}{total_units:.1f}U**\n"
+        f"📊 Week Total: **{sign}{week_total}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"**Daily Breakdown:**\n"
     )
 
-    for day_str in sorted(daily_units.keys()):
+    for day_str in sorted(daily.keys()):
         day_date = date.fromisoformat(day_str)
-        day_net = daily_units[day_str]
-        sign = "+" if day_net >= 0 else ""
+        day_net = daily[day_str]
+        sign_d = "+" if day_net >= 0 else ""
         emoji = "🟢" if day_net > 0 else "🔴" if day_net < 0 else "⚪"
-        report += f"{emoji} {day_date.strftime('%A %b %d')}: {sign}{day_net:.1f}U\n"
+        report += f"{emoji} {day_date.strftime('%A %b %d')}: {sign_d}{day_net}\n"
 
     report += f"\n@everyone"
 
@@ -638,6 +633,181 @@ async def post_weekly_report(session: aiohttp.ClientSession):
         else:
             text = await r.text()
             print(f"⚠️ Failed to post weekly report: {r.status} {text}")
+
+
+async def fetch_month_results(session: aiohttp.ClientSession, first_day: date, last_day: date) -> list:
+    url = (
+        f"{SUPABASE_URL}/rest/v1/results"
+        f"?select=*"
+        f"&match_date=gte.{first_day.isoformat()}"
+        f"&match_date=lte.{last_day.isoformat()}"
+        f"&order=match_time.asc"
+        f"&limit=5000"
+    )
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            print(f"⚠️ Failed to fetch month results: {r.status}")
+            return []
+        return await r.json()
+
+
+async def post_monthly_report(session: aiohttp.ClientSession):
+    now = EST_now()
+    # Previous month
+    first_day = (now.date().replace(day=1) - timedelta(days=1)).replace(day=1)
+    last_day = now.date().replace(day=1) - timedelta(days=1)
+
+    print(f"📊 Building monthly report for {first_day} to {last_day}...")
+    results = await fetch_month_results(session, first_day, last_day)
+
+    if not results:
+        print("⚠️ No results found for this month.")
+        return
+
+    total_wins = total_losses = total_voids = 0
+    weekly = {}
+
+    for row in results:
+        wins = int(row.get("wins", 0))
+        losses = int(row.get("losses", 0))
+        voids = int(row.get("voids", 0))
+        match_date = date.fromisoformat(row.get("match_date"))
+
+        total_wins += wins
+        total_losses += losses
+        total_voids += voids
+
+        # Group by week starting Monday
+        week_start = match_date - timedelta(days=match_date.weekday())
+        week_end = week_start + timedelta(days=6)
+        # Clamp to month boundaries
+        week_start_clamped = max(week_start, first_day)
+        week_end_clamped = min(week_end, last_day)
+        week_key = week_start_clamped.isoformat()
+
+        if week_key not in weekly:
+            weekly[week_key] = {"net": 0, "start": week_start_clamped, "end": week_end_clamped}
+        weekly[week_key]["net"] += wins - losses
+
+    month_total = total_wins - total_losses
+    sign = "+" if month_total >= 0 else ""
+
+    report = (
+        f"🏓 **MONTHLY PERFORMANCE REPORT**\n"
+        f"📅 {first_day.strftime('%B %Y')}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Wins: **{total_wins}**\n"
+        f"❌ Losses: **{total_losses}**\n"
+        f"💀 Voids: **{total_voids}**\n"
+        f"📊 Month Total: **{sign}{month_total}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**Weekly Breakdown:**\n"
+    )
+
+    for week_key in sorted(weekly.keys()):
+        w = weekly[week_key]
+        net = w["net"]
+        sign_w = "+" if net >= 0 else ""
+        emoji = "🟢" if net > 0 else "🔴" if net < 0 else "⚪"
+        start_str = w["start"].strftime("%b %d")
+        end_str = w["end"].strftime("%b %d")
+        report += f"{emoji} Week {start_str}-{end_str}: {sign_w}{net}\n"
+
+    report += f"\n@everyone"
+
+    url = f"{DISCORD_API}/channels/{RESULTS_CHANNEL_ID}/messages"
+    async with session.post(url, headers=DISCORD_HEADERS, json={"content": report}) as r:
+        if r.status in (200, 201):
+            print(f"✅ Monthly report posted successfully.")
+        else:
+            text = await r.text()
+            print(f"⚠️ Failed to post monthly report: {r.status} {text}")
+
+
+WELCOME_MESSAGE = """**Welcome to Offgrid Edge!** 🏓
+
+Premium sports picks — Eastern European Table Tennis and more.
+
+**Choose your membership:**
+👑 **Full Access** — All channels + TT picks & DM alerts
+⚡ **All Sports** — All channels, no TT picks
+
+🔗 https://whop.com/offgrid-edge?a=crashacid
+
+Subscribe on Whop and claim your access there. Let's get it! 🔒"""
+
+
+async def send_welcome_dm(session: aiohttp.ClientSession, user_id: str):
+    """Send welcome DM to a new member."""
+    try:
+        async with session.post(f"{DISCORD_API}/users/@me/channels",
+                                headers=DISCORD_HEADERS,
+                                json={"recipient_id": user_id}) as r:
+            if r.status != 200:
+                return
+            dm = await r.json()
+            dm_channel_id = dm["id"]
+        async with session.post(f"{DISCORD_API}/channels/{dm_channel_id}/messages",
+                                headers=DISCORD_HEADERS,
+                                json={"content": WELCOME_MESSAGE}) as r:
+            if r.status in (200, 201):
+                print(f"👋 Welcome DM sent to user {user_id}")
+            else:
+                print(f"⚠️ Failed to send welcome DM: {r.status}")
+    except Exception as e:
+        print(f"⚠️ Welcome DM error: {e}")
+
+
+async def gateway_listener(session: aiohttp.ClientSession):
+    """Listen for GUILD_MEMBER_ADD events via Discord Gateway."""
+    while True:
+        try:
+            # Get gateway URL
+            async with session.get(f"{DISCORD_API}/gateway", headers=DISCORD_HEADERS) as r:
+                data = await r.json()
+                gateway_url = data["url"] + "?v=10&encoding=json"
+
+            async with session.ws_connect(gateway_url) as ws:
+                heartbeat_interval = None
+                sequence = None
+
+                async def send_heartbeat():
+                    while True:
+                        await asyncio.sleep(heartbeat_interval / 1000)
+                        await ws.send_json({"op": 1, "d": sequence})
+
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        payload = msg.json()
+                        op = payload.get("op")
+                        t = payload.get("t")
+                        d = payload.get("d", {})
+
+                        if payload.get("s"):
+                            sequence = payload["s"]
+
+                        if op == 10:  # Hello
+                            heartbeat_interval = d["heartbeat_interval"]
+                            asyncio.ensure_future(send_heartbeat())
+                            # Identify
+                            await ws.send_json({
+                                "op": 2,
+                                "d": {
+                                    "token": TOKEN,
+                                    "intents": 1 + 2 + 512 + 32768,  # GUILDS, GUILD_MEMBERS, GUILD_MESSAGES, MESSAGE_CONTENT
+                                    "properties": {"os": "linux", "browser": "aiohttp", "device": "aiohttp"}
+                                }
+                            })
+
+                        elif op == 0 and t == "GUILD_MEMBER_ADD":
+                            user_id = d.get("user", {}).get("id")
+                            if user_id:
+                                print(f"👋 New member joined: {user_id}")
+                                await send_welcome_dm(session, user_id)
+
+        except Exception as e:
+            print(f"⚠️ Gateway error: {e} — reconnecting in 10s...")
+            await asyncio.sleep(10)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -655,12 +825,14 @@ async def scanner_loop():
         last_cleanup_date = None
         weekly_report_sent = None
         nightly_sync_done = None
+        monthly_report_sent = None
 
         while True:
             try:
                 now_est = EST_now()
                 today = now_est.date()
                 is_monday = now_est.weekday() == 0
+                is_first_of_month = today.day == 1
                 print(f"🔍 Scanning at {now_est.strftime('%H:%M:%S')} EST...")
 
                 if last_cleanup_date != today:
@@ -673,9 +845,14 @@ async def scanner_loop():
                     await nightly_results_sync(session)
                     nightly_sync_done = today
 
-                # Weekly report — Monday at 8:00am EST
+                # Monthly report — 1st of each month at 8:00am EST
                 is_report_time = now_est.hour == 8 and now_est.minute < 1
-                if is_monday and is_report_time and weekly_report_sent != today:
+                if is_first_of_month and is_report_time and monthly_report_sent != today:
+                    await post_monthly_report(session)
+                    monthly_report_sent = today
+
+                # Weekly report — Monday at 8:00am EST (skip if already posted monthly)
+                if is_monday and not is_first_of_month and is_report_time and weekly_report_sent != today:
                     await post_weekly_report(session)
                     weekly_report_sent = today
 
@@ -700,4 +877,7 @@ async def scanner_loop():
             await asyncio.sleep(CHECK_INTERVAL)
 
 
-asyncio.run(scanner_loop())
+asyncio.run(asyncio.gather(
+    scanner_loop(),
+    gateway_listener(aiohttp.ClientSession(timeout=TIMEOUT))
+))
