@@ -393,6 +393,57 @@ async def send_dm(session: aiohttp.ClientSession, user_id: str, message: str):
             await asyncio.sleep(data.get("retry_after", 1))
 
 
+FREE_PICK_CHANNEL_ID = "1515735232886607902"
+FREE_PICK_EMOJI = "⭐"
+
+
+async def post_free_pick(session: aiohttp.ClientSession):
+    """Find the ⭐ flagged pick and post it to the waiting-room channel."""
+    messages = await get_channel_messages(session)
+    today = EST_now().date()
+    yesterday = today - timedelta(days=1)
+
+    free_pick_line = None
+    for msg in messages:
+        if msg.get("author", {}).get("bot"):
+            continue
+        post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
+        post_date = post_dt.date()
+        if post_date < yesterday:
+            break
+        if post_date not in (today, yesterday):
+            continue
+        content = msg.get("content", "")
+        for line in content.split("\n"):
+            if FREE_PICK_EMOJI in line and re.search(r'\d{1,2}:\d{2}\s*(?:am|pm)', line, re.IGNORECASE):
+                free_pick_line = line.strip()
+                break
+        if free_pick_line:
+            break
+
+    if not free_pick_line:
+        print("⭐ No free pick found for today.")
+        return
+
+    # Clean up the line — remove result emojis and the star
+    clean_line = free_pick_line.replace(FREE_PICK_EMOJI, "").strip()
+
+    message = (
+        f"🎁 **FREE PICK OF THE DAY** 🎁\n\n"
+        f"{clean_line}\n\n"
+        f"Want more picks like this? Subscribe now:\n"
+        f"🔗 https://whop.com/offgrid-edge?a=crashacid"
+    )
+
+    url = f"{DISCORD_API}/channels/{FREE_PICK_CHANNEL_ID}/messages"
+    async with session.post(url, headers=DISCORD_HEADERS, json={"content": message}) as r:
+        if r.status in (200, 201):
+            print(f"⭐ Free pick posted to waiting-room.")
+        else:
+            text = await r.text()
+            print(f"⚠️ Failed to post free pick: {r.status} {text}")
+
+
 # ── Message sync ─────────────────────────────────────────────────────────────
 
 async def sync_picks_from_channel(session: aiohttp.ClientSession):
@@ -826,6 +877,7 @@ async def scanner_loop():
         weekly_report_sent = None
         nightly_sync_done = None
         monthly_report_sent = None
+        free_pick_sent = None
 
         while True:
             try:
@@ -844,6 +896,12 @@ async def scanner_loop():
                 if is_nightly_time and nightly_sync_done != today:
                     await nightly_results_sync(session)
                     nightly_sync_done = today
+
+                # Free pick — daily at noon EST
+                is_noon = now_est.hour == 12 and now_est.minute < 1
+                if is_noon and free_pick_sent != today:
+                    await post_free_pick(session)
+                    free_pick_sent = today
 
                 # Monthly report — 1st of each month at 8:00am EST
                 is_report_time = now_est.hour == 8 and now_est.minute < 1
