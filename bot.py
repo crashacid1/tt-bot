@@ -397,40 +397,18 @@ FREE_PICK_CHANNEL_ID = "1515735232886607902"
 FREE_PICK_EMOJI = "⭐"
 
 
-async def post_free_pick(session: aiohttp.ClientSession):
-    """Find the ⭐ flagged pick and post it to the waiting-room channel."""
-    messages = await get_channel_messages(session)
-    today = EST_now().date()
-    yesterday = today - timedelta(days=1)
-
-    free_pick_line = None
-    for msg in messages:
-        if msg.get("author", {}).get("bot"):
-            continue
-        post_dt = datetime.fromisoformat(msg["timestamp"].replace("Z", "+00:00")).astimezone(EST)
-        post_date = post_dt.date()
-        if post_date < yesterday:
-            break
-        if post_date not in (today, yesterday):
-            continue
-        content = msg.get("content", "")
-        for line in content.split("\n"):
-            if FREE_PICK_EMOJI in line and re.search(r'\d{1,2}:\d{2}\s*(?:am|pm)', line, re.IGNORECASE):
-                free_pick_line = line.strip()
-                break
-        if free_pick_line:
-            break
-
-    if not free_pick_line:
-        print("⭐ No free pick found for today.")
-        return
-
-    # Clean up the line — remove result emojis and the star
-    clean_line = free_pick_line.replace(FREE_PICK_EMOJI, "").strip()
+async def post_free_pick_alert(session: aiohttp.ClientSession, row: dict, match_dt: datetime):
+    """Post the free pick to #waiting-room when the alert fires."""
+    pick_text = row.get("pick", "").replace(FREE_PICK_EMOJI, "").strip()
+    match_time_str = match_dt.strftime("%I:%M %p EDT")
+    match_date_str = match_dt.strftime("%A, %m/%d/%Y")
 
     message = (
         f"🎁 **FREE PICK OF THE DAY** 🎁\n\n"
-        f"{clean_line}\n\n"
+        f"{row['player1']} vs {row['player2']}\n"
+        f"Pick: {pick_text}\n"
+        f"Date: {match_date_str}\n"
+        f"Time: {match_time_str}\n\n"
         f"Want more picks like this? Subscribe now:\n"
         f"🔗 https://whop.com/offgrid-edge?a=crashacid"
     )
@@ -563,6 +541,10 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
         await asyncio.gather(*[send_one(m) for m in real_members])
         print(f"✅ Alert sent to {len(real_members)} members.")
         await db_mark_alert_sent(session, row["alert_key"])
+
+        # If this pick is flagged with ⭐ post it to waiting-room too
+        if FREE_PICK_EMOJI in row.get("pick", ""):
+            await post_free_pick_alert(session, row, match_dt)
 
 
 # ── Nightly results sync ──────────────────────────────────────────────────────
@@ -877,7 +859,6 @@ async def scanner_loop():
         weekly_report_sent = None
         nightly_sync_done = None
         monthly_report_sent = None
-        free_pick_sent = None
 
         while True:
             try:
@@ -896,12 +877,6 @@ async def scanner_loop():
                 if is_nightly_time and nightly_sync_done != today:
                     await nightly_results_sync(session)
                     nightly_sync_done = today
-
-                # Free pick — daily at noon EST
-                is_noon = now_est.hour == 12 and now_est.minute < 1
-                if is_noon and free_pick_sent != today:
-                    await post_free_pick(session)
-                    free_pick_sent = today
 
                 # Monthly report — 1st of each month at 8:00am EST
                 is_report_time = now_est.hour == 8 and now_est.minute < 1
