@@ -486,6 +486,43 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
 alerts_in_progress: set = set()
 
 
+async def db_get_active_clients(session: aiohttp.ClientSession) -> list:
+    """Fetch all active client configs from Supabase."""
+    url = f"{SUPABASE_URL}/rest/v1/clients?select=*&active=eq.true"
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            print(f"⚠️ Failed to fetch clients: {r.status}")
+            return []
+        return await r.json()
+
+
+async def send_alert_to_client(session: aiohttp.ClientSession, client: dict, alert_msg: str):
+    """Send alert DMs to all eligible members in a client's Discord server."""
+    guild_id = client["guild_id"]
+    role_id = client["alert_role_id"]
+    server_name = client["server_name"]
+
+    members = await get_guild_members(session, guild_id)
+    eligible = [
+        m for m in members
+        if not m.get("user", {}).get("bot")
+        and role_id in m.get("roles", [])
+    ]
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def send_one(member, msg=alert_msg):
+        async with semaphore:
+            user = member.get("user", {})
+            try:
+                await asyncio.wait_for(send_dm(session, user["id"], msg), timeout=5)
+            except Exception:
+                pass
+
+    await asyncio.gather(*[send_one(m) for m in eligible])
+    print(f"✅ Alert sent to {len(eligible)} members in {server_name}.")
+
+
 async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: list, now_est: datetime):
     global alerts_in_progress
     alerts_to_send = []
@@ -507,13 +544,17 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
     for row in alerts_to_send:
         alerts_in_progress.add(row["alert_key"])
 
+    # ── Send to Offgrid members ──────────────────────────────────────────────
     members = await get_guild_members(session, guild_id)
     real_members = [
         m for m in members
         if not m.get("user", {}).get("bot")
         and any(role_id in ALERT_ROLE_IDS for role_id in m.get("roles", []))
     ]
-    print(f"📨 Sending to {len(real_members)} eligible members.")
+    print(f"📨 Sending to {len(real_members)} Offgrid members.")
+
+    # ── Fetch active clients ─────────────────────────────────────────────────
+    clients = await db_get_active_clients(session)
 
     for row in alerts_to_send:
         match_dt = datetime.fromisoformat(row["match_time"]).astimezone(EST)
@@ -538,8 +579,14 @@ async def send_alerts(session: aiohttp.ClientSession, guild_id: str, pending: li
                     except Exception:
                         pass
 
+        # Send to Offgrid members
         await asyncio.gather(*[send_one(m) for m in real_members])
-        print(f"✅ Alert sent to {len(real_members)} members.")
+        print(f"✅ Offgrid alert sent to {len(real_members)} members.")
+
+        # Send to each active client
+        for client in clients:
+            await send_alert_to_client(session, client, alert_msg)
+
         await db_mark_alert_sent(session, row["alert_key"])
 
         # If this pick is flagged with ⭐ post it to waiting-room too
@@ -791,56 +838,30 @@ async def send_welcome_dm(session: aiohttp.ClientSession, user_id: str):
         print(f"⚠️ Welcome DM error: {e}")
 
 
-async def gateway_listener(session: aiohttp.ClientSession):
-    """Listen for GUILD_MEMBER_ADD events via Discord Gateway."""
-    while True:
-        try:
-            # Get gateway URL
-            async with session.get(f"{DISCORD_API}/gateway", headers=DISCORD_HEADERS) as r:
-                data = await r.json()
-                gateway_url = data["url"] + "?v=10&encoding=json"
+async def check_new_members(session: aiohttp.ClientSession, guild_id: str, welcomed: set) -> set:
+    """Check for new members and send welcome DMs to anyone not yet welcomed."""
+    members = await get_guild_members(session, guild_id)
+    now_utc = datetime.now(pytz.utc)
 
-            async with session.ws_connect(gateway_url) as ws:
-                heartbeat_interval = None
-                sequence = None
+    for member in members:
+        user = member.get("user", {})
+        if user.get("bot"):
+            continue
+        user_id = user.get("id")
+        if user_id in welcomed:
+            continue
 
-                async def send_heartbeat():
-                    while True:
-                        await asyncio.sleep(heartbeat_interval / 1000)
-                        await ws.send_json({"op": 1, "d": sequence})
+        # Check if member joined in the last 10 minutes
+        joined_at = member.get("joined_at")
+        if joined_at:
+            joined_dt = datetime.fromisoformat(joined_at.replace("Z", "+00:00"))
+            minutes_since_join = (now_utc - joined_dt).total_seconds() / 60
+            if minutes_since_join <= 10:
+                print(f"👋 New member detected: {user.get('username', user_id)}")
+                await send_welcome_dm(session, user_id)
+                welcomed.add(user_id)
 
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        payload = msg.json()
-                        op = payload.get("op")
-                        t = payload.get("t")
-                        d = payload.get("d", {})
-
-                        if payload.get("s"):
-                            sequence = payload["s"]
-
-                        if op == 10:  # Hello
-                            heartbeat_interval = d["heartbeat_interval"]
-                            asyncio.ensure_future(send_heartbeat())
-                            # Identify
-                            await ws.send_json({
-                                "op": 2,
-                                "d": {
-                                    "token": TOKEN,
-                                    "intents": 1 + 2 + 512 + 32768,  # GUILDS, GUILD_MEMBERS, GUILD_MESSAGES, MESSAGE_CONTENT
-                                    "properties": {"os": "linux", "browser": "aiohttp", "device": "aiohttp"}
-                                }
-                            })
-
-                        elif op == 0 and t == "GUILD_MEMBER_ADD":
-                            user_id = d.get("user", {}).get("id")
-                            if user_id:
-                                print(f"👋 New member joined: {user_id}")
-                                await send_welcome_dm(session, user_id)
-
-        except Exception as e:
-            print(f"⚠️ Gateway error: {e} — reconnecting in 10s...")
-            await asyncio.sleep(10)
+    return welcomed
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -859,6 +880,8 @@ async def scanner_loop():
         weekly_report_sent = None
         nightly_sync_done = None
         monthly_report_sent = None
+        welcomed_members: set = set()
+        last_member_check = None
 
         while True:
             try:
@@ -877,6 +900,11 @@ async def scanner_loop():
                 if is_nightly_time and nightly_sync_done != today:
                     await nightly_results_sync(session)
                     nightly_sync_done = today
+
+                # Check for new members every 5 minutes
+                if last_member_check is None or (now_est - last_member_check).total_seconds() >= 300:
+                    welcomed_members = await check_new_members(session, guild_id, welcomed_members)
+                    last_member_check = now_est
 
                 # Monthly report — 1st of each month at 8:00am EST
                 is_report_time = now_est.hour == 8 and now_est.minute < 1
@@ -911,11 +939,19 @@ async def scanner_loop():
 
 
 async def main():
-    async with aiohttp.ClientSession(timeout=TIMEOUT) as gateway_session:
-        await asyncio.gather(
-            scanner_loop(),
-            gateway_listener(gateway_session)
-        )
+    await scanner_loop()
 
 
 asyncio.run(main())
+
+# ── Multi-client infrastructure ───────────────────────────────────────────────
+# Clients table in Supabase stores config for each external Discord server
+# Schema:
+# CREATE TABLE clients (
+#     id SERIAL PRIMARY KEY,
+#     server_name TEXT NOT NULL,
+#     guild_id TEXT NOT NULL UNIQUE,
+#     alert_role_id TEXT NOT NULL,
+#     active BOOLEAN DEFAULT TRUE,
+#     created_at TIMESTAMPTZ DEFAULT NOW()
+# );
