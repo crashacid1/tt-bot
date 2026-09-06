@@ -488,12 +488,14 @@ alerts_in_progress: set = set()
 
 async def db_get_active_clients(session: aiohttp.ClientSession) -> list:
     """Fetch all active client configs from Supabase."""
-    url = f"{SUPABASE_URL}/rest/v1/clients?select=*&active=eq.true"
-    async with session.get(url, headers=SUPABASE_HEADERS) as r:
-        if r.status != 200:
-            print(f"⚠️ Failed to fetch clients: {r.status}")
-            return []
-        return await r.json()
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/clients?select=*&active=eq.true"
+        async with session.get(url, headers=SUPABASE_HEADERS) as r:
+            if r.status != 200:
+                return []  # Table doesn't exist yet or no clients
+            return await r.json()
+    except Exception:
+        return []
 
 
 async def send_alert_to_client(session: aiohttp.ClientSession, client: dict, alert_msg: str):
