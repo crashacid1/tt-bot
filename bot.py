@@ -36,6 +36,29 @@ ALERT_ROLE_IDS = {
     "1486190812915175465",  # Admin
 }
 
+# League emoji mapping
+LEAGUE_MAP = {
+    "🌐": "TT CUP",
+    "🇨🇿": "CZECH",
+    "🇵🇱": "ELITE",
+    "🇺🇦": "SETKA",
+}
+
+
+def detect_league(text: str) -> str | None:
+    """Detect league from emoji in pick line."""
+    for emoji, league in LEAGUE_MAP.items():
+        if emoji in text:
+            return league
+    return None
+
+
+def strip_league_emoji(text: str) -> str:
+    """Remove league emojis from text."""
+    for emoji in LEAGUE_MAP:
+        text = text.replace(emoji, "")
+    return text.strip()
+
 
 # ── Result calculation ────────────────────────────────────────────────────────
 
@@ -103,7 +126,10 @@ async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
         "player2": pick["player2"],
         "pick": pick["pick"],
         "alert_key": pick["alert_key"],
-        "alert_sent": False
+        "alert_sent": False,
+        "league": pick.get("league"),
+        "posted_to_clients": False,
+        "client_message_id": None,
     }
     async with session.post(url, headers=SUPABASE_UPSERT_HEADERS, json=payload) as r:
         if r.status not in (200, 201):
@@ -214,6 +240,17 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
     today = now.date()
     yesterday = today - timedelta(days=1)
 
+    # Process line by line to detect league emoji at start
+    lines = text.split("\n")
+    cleaned_lines = []
+    line_leagues = []
+    for line in lines:
+        league = detect_league(line)
+        cleaned = strip_league_emoji(line)
+        cleaned_lines.append(cleaned)
+        line_leagues.append(league)
+    cleaned_text = "\n".join(cleaned_lines)
+
     pattern1 = re.compile(
         r"(\d{1,2}:\d{2}\s*(?:am|pm))\s+"
         r"(.+?)\s+vs\s+"
@@ -237,22 +274,32 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
                 return candidate
         return match_dt
 
+    def get_line_league(match_start: int) -> str | None:
+        """Get the league for the line containing this match position."""
+        pos = 0
+        for i, line in enumerate(cleaned_lines):
+            if pos <= match_start <= pos + len(line):
+                return line_leagues[i]
+            pos += len(line) + 1
+        return None
+
     seen_keys = set()
-    for m in pattern1.finditer(text):
+    for m in pattern1.finditer(cleaned_text):
         time_str, player1, player2, pick = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
         if has_result(pick):
-            continue  # Skip picks with result emojis for alerts
+            continue
         try:
             t = datetime.strptime(time_str.replace(" ", "").upper(), "%I:%M%p")
             match_dt = resolve_match_dt(t, post_date)
         except ValueError:
             continue
+        league = get_line_league(m.start())
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
         if alert_key not in seen_keys:
             seen_keys.add(alert_key)
-            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key, "league": league})
 
-    for m in pattern2.finditer(text):
+    for m in pattern2.finditer(cleaned_text):
         time_str, player1, pick, player2 = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
         if has_result(pick):
             continue
@@ -261,10 +308,11 @@ def parse_picks(text: str, post_date: date) -> list[dict]:
             match_dt = resolve_match_dt(t, post_date)
         except ValueError:
             continue
+        league = get_line_league(m.start())
         alert_key = f"{match_dt.strftime('%Y%m%d')}-{match_dt.strftime('%H%M')}-{player1.lower().replace(' ', '')}v{player2.lower().replace(' ', '')}"
         if alert_key not in seen_keys:
             seen_keys.add(alert_key)
-            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key})
+            picks.append({"match_time": match_dt, "player1": player1, "player2": player2, "pick": pick, "alert_key": alert_key, "league": league})
 
     return picks
 
