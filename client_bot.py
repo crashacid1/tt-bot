@@ -64,7 +64,7 @@ def detect_units(text: str) -> str:
 
 def detect_pick_type(text: str) -> str:
     """Detect OVER or UNDER from pick text."""
-    if re.search(r'\bUNDER\b', text, re.IGNORECASE):
+    if re.search(r'\bUND+ER+\b', text, re.IGNORECASE):
         return "UNDER"
     return "OVER"
 
@@ -101,6 +101,7 @@ async def db_get_unposted_picks(session: aiohttp.ClientSession) -> list:
         f"&league=not.is.null"
         f"&match_time=gte.{from_str}"
         f"&match_time=lte.{to_str}"
+        f"&order=match_time.asc"
     )
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
