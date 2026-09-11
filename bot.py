@@ -12,6 +12,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 BETSAPI_TOKEN = os.environ.get("BETSAPI_TOKEN")  # Optional — auto-results only work if set
 PICKS_CHANNEL_ID = "1466857635746808020"
 RESULTS_CHANNEL_ID = "1466857650607100027"
+ADMIN_RESULTS_CHANNEL_ID = "1548045193184546816"
 TT_SPORT_ID = 92  # BetsAPI sport ID for table tennis
 DEFAULT_LINE = 73.5  # Default OVER/UNDER line
 EST = pytz.timezone("US/Eastern")
@@ -133,6 +134,7 @@ async def db_insert_pick(session: aiohttp.ClientSession, pick: dict):
         "league": pick.get("league"),
         "posted_to_clients": False,
         "client_message_id": None,
+        "discord_message_id": pick.get("discord_message_id"),
     }
     async with session.post(url, headers=SUPABASE_UPSERT_HEADERS, json=payload) as r:
         if r.status not in (200, 201):
@@ -498,6 +500,9 @@ async def sync_picks_from_channel(session: aiohttp.ClientSession):
         if not content.strip():
             continue
         picks = parse_picks(content, post_date)
+        # Attach message ID to each pick so we can edit the message later
+        for pick in picks:
+            pick["discord_message_id"] = msg["id"]
         print(f"📝 Message from {post_date}: {len(picks)} picks parsed.")
         all_picks.extend(picks)
 
@@ -1029,6 +1034,62 @@ async def get_channel_message(session: aiohttp.ClientSession, message_id: str) -
         return await r.json()
 
 
+async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pts: int, home_pts: int, away_pts: int, line: float, result: str, match_dt: datetime):
+    """Post result to admin-only channel."""
+    league = pick.get("league", "")
+    league_str = f"{league}\n" if league else ""
+    pick_type = "UNDER" if re.search(r'UND+ER', pick.get("pick", ""), re.IGNORECASE) else "OVER"
+    result_label = "✅ HIT" if result == "✅" else "❌ MISS"
+
+    message = (
+        f"📊 **RESULT: {league_str}**"
+        f"{pick['player1']} vs {pick['player2']}\n"
+        f"Pick: **{pick_type}** (line {line})\n"
+        f"Score: {home_pts}+{away_pts} = **{total_pts} pts**\n"
+        f"Time: {match_dt.strftime('%I:%M %p EST')}\n"
+        f"Result: **{result_label}**"
+    )
+
+    url = f"{DISCORD_API}/channels/{ADMIN_RESULTS_CHANNEL_ID}/messages"
+    async with session.post(url, headers=DISCORD_HEADERS, json={"content": message}) as r:
+        if r.status in (200, 201):
+            print(f"📬 Admin result posted: {pick['player1']} vs {pick['player2']} → {result_label}")
+        else:
+            print(f"⚠️ Failed to post admin result: {r.status}")
+    """Find the pick line in a Discord message and append the result emoji."""
+    try:
+        # Fetch the current message
+        url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages/{message_id}"
+        async with session.get(url, headers=DISCORD_HEADERS) as r:
+            if r.status != 200:
+                return
+            msg = await r.json()
+
+        content = msg.get("content", "")
+        lines = content.split("\n")
+        updated_lines = []
+        edited = False
+
+        for line in lines:
+            # Find the line with this match
+            if player1.lower() in line.lower() and player2.lower() in line.lower():
+                # Only add result if line doesn't already have one
+                if not any(e in line for e in ["✅", "❌", "💀"]):
+                    line = line.rstrip() + f" {result}"
+                    edited = True
+            updated_lines.append(line)
+
+        if edited:
+            new_content = "\n".join(updated_lines)
+            async with session.patch(url, headers=DISCORD_HEADERS, json={"content": new_content}) as r:
+                if r.status in (200, 204):
+                    print(f"✏️ Discord message updated: {player1} vs {player2} → {result}")
+                else:
+                    print(f"⚠️ Failed to edit Discord message: {r.status}")
+    except Exception as e:
+        print(f"⚠️ Edit message error: {e}")
+
+
 async def auto_track_results(session: aiohttp.ClientSession):
     """Check BetsAPI for results of pending picks and update Discord messages."""
     if not BETSAPI_TOKEN:
@@ -1044,7 +1105,6 @@ async def auto_track_results(session: aiohttp.ClientSession):
         try:
             match_dt = datetime.fromisoformat(pick["match_time"]).astimezone(EST)
 
-            # Search for the event on BetsAPI
             event = await betsapi_search_event(session, pick["player1"], pick["player2"], match_dt)
             if not event:
                 print(f"⚠️ No BetsAPI match found: {pick['player1']} vs {pick['player2']}")
@@ -1053,29 +1113,36 @@ async def auto_track_results(session: aiohttp.ClientSession):
             event_id = str(event.get("id"))
             score = await betsapi_get_score(session, event_id)
             if not score:
-                continue  # Match not finished yet
+                continue
 
             home_pts, away_pts = score
             total_pts = home_pts + away_pts
             pick_text = pick.get("pick", "").upper()
 
-            # Determine if OVER or UNDER
-            is_over = "OVER" in pick_text
-            is_under = "UNDER" in pick_text or re.search(r'UND+ER', pick_text)
+            is_under = bool(re.search(r'UND+ER', pick_text, re.IGNORECASE))
             line = extract_line(pick_text)
 
             if is_under:
                 result = "✅" if total_pts < line else "❌"
-            else:  # Default OVER
+            else:
                 result = "✅" if total_pts > line else "❌"
 
             print(f"📊 {pick['player1']} vs {pick['player2']}: {home_pts}+{away_pts}={total_pts} pts (line {line}) → {result}")
 
+            # Save to DB
             await db_save_auto_result(session, pick["alert_key"], result)
+
+            # Post to admin results channel
+            await post_admin_result(session, pick, total_pts, home_pts, away_pts, line, result, match_dt)
+
+            # Edit the Discord message
+            discord_message_id = pick.get("discord_message_id")
+            if discord_message_id:
+                await edit_discord_pick_message(session, discord_message_id, pick["player1"], pick["player2"], result)
 
         except Exception as e:
             print(f"⚠️ Auto-result error for {pick.get('player1')}: {e}")
-        
+
         await asyncio.sleep(0.5)
 
 
