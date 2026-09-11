@@ -937,7 +937,6 @@ async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, pla
     if not BETSAPI_TOKEN:
         return None
     try:
-        # Search with a 30 minute window around match time
         time_unix = int(match_dt.timestamp())
         url = (
             f"https://api.betsapi.com/v1/events/search"
@@ -947,13 +946,19 @@ async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, pla
             f"&away={player2}"
             f"&time={time_unix}"
         )
+        print(f"🔎 BetsAPI searching: {player1} vs {player2} at {match_dt.strftime('%H:%M EST')}")
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
+                print(f"⚠️ BetsAPI search HTTP error: {r.status}")
                 return None
             data = await r.json()
+            print(f"🔎 BetsAPI response: success={data.get('success')} results={len(data.get('results', []))}")
             results = data.get("results", [])
             if results:
+                print(f"✅ BetsAPI found: {results[0].get('home', {}).get('name')} vs {results[0].get('away', {}).get('name')}")
                 return results[0]
+            else:
+                print(f"⚠️ BetsAPI no results for {player1} vs {player2}")
     except Exception as e:
         print(f"⚠️ BetsAPI search error: {e}")
     return None
