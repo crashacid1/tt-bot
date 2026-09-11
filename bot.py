@@ -9,8 +9,11 @@ import pytz
 TOKEN = os.environ["DISCORD_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+BETSAPI_TOKEN = os.environ.get("BETSAPI_TOKEN")  # Optional — auto-results only work if set
 PICKS_CHANNEL_ID = "1466857635746808020"
 RESULTS_CHANNEL_ID = "1466857650607100027"
+TT_SPORT_ID = 92  # BetsAPI sport ID for table tennis
+DEFAULT_LINE = 73.5  # Default OVER/UNDER line
 EST = pytz.timezone("US/Eastern")
 CHECK_INTERVAL = 20
 DISCORD_API = "https://discord.com/api/v10"
@@ -914,6 +917,168 @@ async def check_new_members(session: aiohttp.ClientSession, guild_id: str, welco
     return welcomed
 
 
+# ── BetsAPI result tracking ───────────────────────────────────────────────────
+
+def extract_line(pick_text: str) -> float:
+    """Extract the OVER/UNDER line from pick text. Default 73.5."""
+    match = re.search(r'(\d+\.?\d+)', pick_text)
+    if match:
+        return float(match.group(1))
+    return DEFAULT_LINE
+
+
+async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, player2: str, match_dt: datetime) -> dict | None:
+    """Search BetsAPI for a specific match."""
+    if not BETSAPI_TOKEN:
+        return None
+    try:
+        # Search with a 30 minute window around match time
+        time_unix = int(match_dt.timestamp())
+        url = (
+            f"https://api.betsapi.com/v1/events/search"
+            f"?token={BETSAPI_TOKEN}"
+            f"&sport_id={TT_SPORT_ID}"
+            f"&home={player1}"
+            f"&away={player2}"
+            f"&time={time_unix}"
+        )
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            results = data.get("results", [])
+            if results:
+                return results[0]
+    except Exception as e:
+        print(f"⚠️ BetsAPI search error: {e}")
+    return None
+
+
+async def betsapi_get_score(session: aiohttp.ClientSession, event_id: str) -> tuple[int, int] | None:
+    """Get the final score for an event. Returns (home_score, away_score) or None."""
+    if not BETSAPI_TOKEN:
+        return None
+    try:
+        url = f"https://api.betsapi.com/v1/event/view?token={BETSAPI_TOKEN}&event_id={event_id}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            results = data.get("results", [])
+            if not results:
+                return None
+            event = results[0]
+            # time_status 3 = ended
+            if event.get("time_status") != "3":
+                return None
+            scores = event.get("ss", "")
+            if not scores:
+                return None
+            # Score format: "21-15" or "21-15,18-21,21-18"
+            # Sum all points
+            home_total = 0
+            away_total = 0
+            for game in scores.split(","):
+                parts = game.split("-")
+                if len(parts) == 2:
+                    try:
+                        home_total += int(parts[0])
+                        away_total += int(parts[1])
+                    except ValueError:
+                        pass
+            return home_total, away_total
+    except Exception as e:
+        print(f"⚠️ BetsAPI score error: {e}")
+    return None
+
+
+async def db_get_pending_results(session: aiohttp.ClientSession) -> list:
+    """Get picks that have started but don't have auto results yet."""
+    now_utc = datetime.now(pytz.utc)
+    # Matches that started more than 15 minutes ago but less than 3 hours ago
+    from_utc = (now_utc - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_utc = (now_utc - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"{SUPABASE_URL}/rest/v1/picks"
+        f"?select=*"
+        f"&alert_sent=eq.true"
+        f"&auto_result=is.null"
+        f"&match_time=gte.{from_utc}"
+        f"&match_time=lte.{to_utc}"
+    )
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            return []
+        return await r.json()
+
+
+async def db_save_auto_result(session: aiohttp.ClientSession, alert_key: str, result: str):
+    """Save auto result to picks table."""
+    url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
+    async with session.patch(url, headers=SUPABASE_HEADERS, json={"auto_result": result}) as r:
+        if r.status not in (200, 204):
+            print(f"⚠️ Failed to save auto result: {r.status}")
+
+
+async def get_channel_message(session: aiohttp.ClientSession, message_id: str) -> dict | None:
+    """Fetch a specific message from the picks channel."""
+    url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages/{message_id}"
+    async with session.get(url, headers=DISCORD_HEADERS) as r:
+        if r.status != 200:
+            return None
+        return await r.json()
+
+
+async def auto_track_results(session: aiohttp.ClientSession):
+    """Check BetsAPI for results of pending picks and update Discord messages."""
+    if not BETSAPI_TOKEN:
+        return
+
+    pending = await db_get_pending_results(session)
+    if not pending:
+        return
+
+    print(f"🔍 Auto-tracking {len(pending)} pending results...")
+
+    for pick in pending:
+        try:
+            match_dt = datetime.fromisoformat(pick["match_time"]).astimezone(EST)
+
+            # Search for the event on BetsAPI
+            event = await betsapi_search_event(session, pick["player1"], pick["player2"], match_dt)
+            if not event:
+                print(f"⚠️ No BetsAPI match found: {pick['player1']} vs {pick['player2']}")
+                continue
+
+            event_id = str(event.get("id"))
+            score = await betsapi_get_score(session, event_id)
+            if not score:
+                continue  # Match not finished yet
+
+            home_pts, away_pts = score
+            total_pts = home_pts + away_pts
+            pick_text = pick.get("pick", "").upper()
+
+            # Determine if OVER or UNDER
+            is_over = "OVER" in pick_text
+            is_under = "UNDER" in pick_text or re.search(r'UND+ER', pick_text)
+            line = extract_line(pick_text)
+
+            if is_under:
+                result = "✅" if total_pts < line else "❌"
+            else:  # Default OVER
+                result = "✅" if total_pts > line else "❌"
+
+            print(f"📊 {pick['player1']} vs {pick['player2']}: {home_pts}+{away_pts}={total_pts} pts (line {line}) → {result}")
+
+            await db_save_auto_result(session, pick["alert_key"], result)
+
+        except Exception as e:
+            print(f"⚠️ Auto-result error for {pick.get('player1')}: {e}")
+        
+        await asyncio.sleep(0.5)
+
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 async def scanner_loop():
@@ -950,6 +1115,10 @@ async def scanner_loop():
                 if is_nightly_time and nightly_sync_done != today:
                     await nightly_results_sync(session)
                     nightly_sync_done = today
+
+                # Auto-track results via BetsAPI every 5 minutes
+                if BETSAPI_TOKEN and (last_member_check is None or (now_est - last_member_check).total_seconds() >= 300):
+                    await auto_track_results(session)
 
                 # Check for new members every 5 minutes
                 if last_member_check is None or (now_est - last_member_check).total_seconds() >= 300:
