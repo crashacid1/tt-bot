@@ -933,34 +933,48 @@ def extract_line(pick_text: str) -> float:
 
 
 async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, player2: str, match_dt: datetime) -> dict | None:
-    """Search BetsAPI for a specific match."""
+    """Search BetsAPI using last name only for better matching."""
     if not BETSAPI_TOKEN:
         return None
     try:
+        def get_last_name(name: str) -> str:
+            parts = name.replace(".", "").strip().split()
+            surnames = [p for p in parts if len(p) > 1]
+            return surnames[0] if surnames else name
+
+        home = get_last_name(player1)
+        away = get_last_name(player2)
         time_unix = int(match_dt.timestamp())
-        url = (
-            f"https://api.betsapi.com/v1/events/search"
-            f"?token={BETSAPI_TOKEN}"
-            f"&sport_id={TT_SPORT_ID}"
-            f"&home={player1}"
-            f"&away={player2}"
-            f"&time={time_unix}"
-        )
-        print(f"🔎 BetsAPI searching: {player1} vs {player2} at {match_dt.strftime('%H:%M EST')}")
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                print(f"⚠️ BetsAPI search HTTP error: {r.status}")
+
+        async def do_search(h, a):
+            url = (
+                f"https://api.betsapi.com/v1/events/search"
+                f"?token={BETSAPI_TOKEN}"
+                f"&sport_id={TT_SPORT_ID}"
+                f"&home={h}"
+                f"&away={a}"
+                f"&time={time_unix}"
+            )
+            print(f"Searching BetsAPI: {h} vs {a} at {match_dt.strftime('%H:%M EST')}")
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    print(f"BetsAPI HTTP error: {r.status}")
+                    return None
+                data = await r.json()
+                results = data.get("results", [])
+                if results:
+                    found_home = results[0].get("home", {}).get("name", "")
+                    found_away = results[0].get("away", {}).get("name", "")
+                    print(f"BetsAPI found: {found_home} vs {found_away}")
+                    return results[0]
                 return None
-            data = await r.json()
-            print(f"🔎 BetsAPI response: success={data.get('success')} results={len(data.get('results', []))}")
-            results = data.get("results", [])
-            if results:
-                print(f"✅ BetsAPI found: {results[0].get('home', {}).get('name')} vs {results[0].get('away', {}).get('name')}")
-                return results[0]
-            else:
-                print(f"⚠️ BetsAPI no results for {player1} vs {player2}")
+
+        result = await do_search(home, away)
+        if not result:
+            print(f"BetsAPI no results for {home} vs {away}")
+        return result
     except Exception as e:
-        print(f"⚠️ BetsAPI search error: {e}")
+        print(f"BetsAPI search error: {e}")
     return None
 
 
