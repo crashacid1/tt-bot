@@ -928,8 +928,32 @@ def extract_line(pick_text: str) -> float:
     """Extract the OVER/UNDER line from pick text. Default 73.5."""
     match = re.search(r'(\d+\.?\d+)', pick_text)
     if match:
-        return float(match.group(1))
+        val = float(match.group(1))
+        if val > 10:  # Ignore small numbers like 2.5 (spread)
+            return val
     return DEFAULT_LINE
+
+
+def is_split_pick(pick_text: str) -> bool:
+    """Check if pick contains SPLIT."""
+    return bool(re.search(r'\bSPLIT\b', pick_text, re.IGNORECASE))
+
+
+def is_splitdd_pick(pick_text: str) -> bool:
+    """Check if pick contains SPLITDD."""
+    return bool(re.search(r'\bSPLITDD\b', pick_text, re.IGNORECASE))
+
+
+def get_split_player(pick_text: str, player1: str, player2: str) -> str | None:
+    """Extract which player is expected to win Set 1 from pick text."""
+    match = re.search(r'SPLIT\s+(?:ONLY\s+)?if\s+(\w+)\s+wins', pick_text, re.IGNORECASE)
+    if match:
+        name_fragment = match.group(1).lower()
+        if name_fragment in player1.lower():
+            return "home"
+        elif name_fragment in player2.lower():
+            return "away"
+    return None  # No specific player mentioned
 
 
 async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, player2: str, match_dt: datetime) -> dict | None:
@@ -958,7 +982,6 @@ async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, pla
             print(f"Searching BetsAPI: {h} vs {a} at {match_dt.strftime('%H:%M EST')}")
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status != 200:
-                    print(f"BetsAPI HTTP error: {r.status}")
                     return None
                 data = await r.json()
                 results = data.get("results", [])
@@ -978,54 +1001,8 @@ async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, pla
     return None
 
 
-async def betsapi_get_odds(session: aiohttp.ClientSession, event_id: str) -> dict | None:
-    """Get Over/Under odds and line from BetsAPI for a table tennis event."""
-    if not BETSAPI_TOKEN:
-        return None
-    try:
-        url = (
-            f"https://api.b365api.com/v2/event/odds"
-            f"?token={BETSAPI_TOKEN}"
-            f"&event_id={event_id}"
-            f"&odds_market=3"  # Over/Under market
-        )
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            results = data.get("results", {})
-
-            # Look for the O/U market in bet365 data
-            for market_key, market_data in results.items():
-                if "_3" in market_key:  # Over/Under market
-                    odds_list = market_data.get("odds", [])
-                    for odds_entry in odds_list:
-                        handicap = odds_entry.get("handicap")
-                        over_odds = odds_entry.get("home_od")  # Over odds
-                        under_odds = odds_entry.get("away_od")  # Under odds
-                        if handicap and over_odds:
-                            return {
-                                "line": float(handicap),
-                                "over_odds": float(over_odds),
-                                "under_odds": float(under_odds) if under_odds else None
-                            }
-    except Exception as e:
-        print(f"⚠️ BetsAPI odds error: {e}")
-    return None
-
-
-async def db_save_odds(session: aiohttp.ClientSession, alert_key: str, line: float, over_odds: float, under_odds: float):
-    """Save odds data to picks table."""
-    url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
-    payload = {
-        "betting_line": line,
-        "over_odds": over_odds,
-        "under_odds": under_odds
-    }
-    async with session.patch(url, headers=SUPABASE_HEADERS, json=payload) as r:
-        if r.status not in (200, 204):
-            print(f"⚠️ Failed to save odds: {r.status}")
-    """Get the final score for an event. Returns (home_total_pts, away_total_pts) or None."""
+async def betsapi_get_live_event(session: aiohttp.ClientSession, event_id: str) -> dict | None:
+    """Get live event data including set-by-set scores."""
     if not BETSAPI_TOKEN:
         return None
     try:
@@ -1035,47 +1012,91 @@ async def db_save_odds(session: aiohttp.ClientSession, alert_key: str, line: flo
                 return None
             data = await r.json()
             results = data.get("results", [])
-            if not results:
-                return None
-            event = results[0]
-
-            # time_status 3 = ended
-            if event.get("time_status") != "3":
-                return None
-
-            # Try to get individual set scores from 'scores' field
-            scores_data = event.get("scores", {})
-            home_total = 0
-            away_total = 0
-
-            if scores_data:
-                # scores is a dict like {"1": {"home": "11", "away": "9"}, "2": {...}}
-                for set_num, set_score in scores_data.items():
-                    try:
-                        home_total += int(set_score.get("home", 0))
-                        away_total += int(set_score.get("away", 0))
-                    except (ValueError, TypeError):
-                        pass
-                print(f"📊 Set scores: {scores_data} → Total: {home_total}+{away_total}={home_total+away_total}")
-                return home_total, away_total
-
-            # Fallback to ss field if scores not available
-            ss = event.get("ss", "")
-            if ss:
-                print(f"⚠️ No set scores available, falling back to ss: {ss}")
-                # ss format for TT is usually sets won like "3-2"
-                # This is unreliable for points, return None
-                return None
-
+            return results[0] if results else None
     except Exception as e:
-        print(f"⚠️ BetsAPI score error: {e}")
+        print(f"BetsAPI live event error: {e}")
+    return None
+
+
+async def betsapi_get_score(session: aiohttp.ClientSession, event_id: str) -> dict | None:
+    """Get final set-by-set scores. Returns dict with sets and totals."""
+    if not BETSAPI_TOKEN:
+        return None
+    try:
+        event = await betsapi_get_live_event(session, event_id)
+        if not event:
+            return None
+        if event.get("time_status") != "3":
+            return None  # Not finished
+
+        scores_data = event.get("scores", {})
+        if not scores_data:
+            return None
+
+        sets = {}
+        for set_num, set_score in scores_data.items():
+            try:
+                home = int(set_score.get("home", 0))
+                away = int(set_score.get("away", 0))
+                sets[int(set_num)] = {"home": home, "away": away}
+            except (ValueError, TypeError):
+                pass
+
+        if not sets:
+            return None
+
+        total_home = sum(s["home"] for s in sets.values())
+        total_away = sum(s["away"] for s in sets.values())
+
+        return {
+            "sets": sets,
+            "total_home": total_home,
+            "total_away": total_away,
+            "total": total_home + total_away,
+            "num_sets": len(sets)
+        }
+    except Exception as e:
+        print(f"BetsAPI score error: {e}")
+    return None
+
+
+async def betsapi_get_odds(session: aiohttp.ClientSession, event_id: str) -> dict | None:
+    """Get Over/Under odds and line from BetsAPI."""
+    if not BETSAPI_TOKEN:
+        return None
+    try:
+        url = (
+            f"https://api.b365api.com/v2/event/odds"
+            f"?token={BETSAPI_TOKEN}"
+            f"&event_id={event_id}"
+            f"&odds_market=3"
+        )
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            results = data.get("results", {})
+            for market_key, market_data in results.items():
+                if "_3" in market_key:
+                    odds_list = market_data.get("odds", [])
+                    for odds_entry in odds_list:
+                        handicap = odds_entry.get("handicap")
+                        over_odds = odds_entry.get("home_od")
+                        under_odds = odds_entry.get("away_od")
+                        if handicap and over_odds:
+                            return {
+                                "line": float(handicap),
+                                "over_odds": float(over_odds),
+                                "under_odds": float(under_odds) if under_odds else None
+                            }
+    except Exception as e:
+        print(f"BetsAPI odds error: {e}")
     return None
 
 
 async def db_get_pending_results(session: aiohttp.ClientSession) -> list:
-    """Get picks that have started but don't have auto results yet."""
+    """Get OVER/UNDER picks (no SPLIT) that started 15+ min ago with no auto result."""
     now_utc = datetime.now(pytz.utc)
-    # Matches that started more than 15 minutes ago but less than 3 hours ago
     from_utc = (now_utc - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     to_utc = (now_utc - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = (
@@ -1089,52 +1110,143 @@ async def db_get_pending_results(session: aiohttp.ClientSession) -> list:
     async with session.get(url, headers=SUPABASE_HEADERS) as r:
         if r.status != 200:
             return []
-        return await r.json()
+        rows = await r.json()
+        # Only pure OVER/UNDER picks — no SPLIT or SPLITDD
+        return [row for row in rows if not is_split_pick(row.get("pick", "")) and not is_splitdd_pick(row.get("pick", ""))]
+
+
+async def db_get_pending_split_results(session: aiohttp.ClientSession) -> list:
+    """Get SPLIT/SPLITDD picks that started but have no auto result yet."""
+    now_utc = datetime.now(pytz.utc)
+    from_utc = (now_utc - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_utc = (now_utc - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (
+        f"{SUPABASE_URL}/rest/v1/picks"
+        f"?select=*"
+        f"&alert_sent=eq.true"
+        f"&auto_result=is.null"
+        f"&match_time=gte.{from_utc}"
+        f"&match_time=lte.{to_utc}"
+    )
+    async with session.get(url, headers=SUPABASE_HEADERS) as r:
+        if r.status != 200:
+            return []
+        rows = await r.json()
+        return [row for row in rows if is_split_pick(row.get("pick", "")) or is_splitdd_pick(row.get("pick", ""))]
 
 
 async def db_save_auto_result(session: aiohttp.ClientSession, alert_key: str, result: str):
-    """Save auto result to picks table."""
     url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
     async with session.patch(url, headers=SUPABASE_HEADERS, json={"auto_result": result}) as r:
         if r.status not in (200, 204):
-            print(f"⚠️ Failed to save auto result: {r.status}")
+            print(f"Failed to save auto result: {r.status}")
 
 
-async def get_channel_message(session: aiohttp.ClientSession, message_id: str) -> dict | None:
-    """Fetch a specific message from the picks channel."""
-    url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages/{message_id}"
-    async with session.get(url, headers=DISCORD_HEADERS) as r:
-        if r.status != 200:
-            return None
-        return await r.json()
+async def db_save_odds(session: aiohttp.ClientSession, alert_key: str, line: float, over_odds: float, under_odds: float):
+    url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
+    payload = {"betting_line": line, "over_odds": over_odds, "under_odds": under_odds}
+    async with session.patch(url, headers=SUPABASE_HEADERS, json=payload) as r:
+        if r.status not in (200, 204):
+            print(f"Failed to save odds: {r.status}")
 
 
-async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pts: int, home_pts: int, away_pts: int, line: float, result: str, match_dt: datetime, roi: float | None = None):
+def calculate_split_result(score: dict, pick_text: str, player1: str, player2: str) -> str:
+    """
+    Calculate SPLIT result from set scores.
+    SPLIT = Set 1 loser wins Set 2 (comeback).
+    """
+    sets = score.get("sets", {})
+    set1 = sets.get(1)
+    set2 = sets.get(2)
+
+    if not set1 or not set2:
+        return "💀"  # Incomplete data
+
+    # Who won Set 1?
+    set1_home_won = set1["home"] > set1["away"]
+
+    # Who won Set 2?
+    set2_home_won = set2["home"] > set2["away"]
+
+    # SPLIT = different winners in Set 1 and Set 2
+    if set1_home_won != set2_home_won:
+        return "✅"  # Comeback happened
+    else:
+        return "❌"  # Same player won both
+
+
+def calculate_splitdd_result(score: dict, pick_text: str, opening_line: float) -> tuple[str, str, str]:
+    """
+    Calculate SPLITDD result: (over_result, split_result, dd_result)
+    OVER = total points vs opening line
+    SPLIT = Set 1 loser wins Set 2
+    DD = if match goes to Set 3, Sets 1+2 total < 70 (live line at Set 3 start)
+         if no Set 3 (sweep), DD is void
+    """
+    sets = score.get("sets", {})
+    total = score.get("total", 0)
+    num_sets = score.get("num_sets", 0)
+
+    set1 = sets.get(1)
+    set2 = sets.get(2)
+    set3 = sets.get(3)
+
+    # OVER result
+    is_under = bool(re.search(r'UND+ER', pick_text, re.IGNORECASE))
+    if is_under:
+        over_result = "✅" if total < opening_line else "❌"
+    else:
+        over_result = "✅" if total > opening_line else "❌"
+
+    # SPLIT result
+    if not set1 or not set2:
+        return over_result, "💀", "💀"
+
+    set1_home_won = set1["home"] > set1["away"]
+    set2_home_won = set2["home"] > set2["away"]
+    split_result = "✅" if set1_home_won != set2_home_won else "❌"
+
+    # DD result
+    if num_sets < 3:
+        # No Set 3 — match was a sweep, DD is void
+        dd_result = "💀"
+    else:
+        # Set 3 happened — check if Sets 1+2 total < 70
+        sets_12_total = set1["home"] + set1["away"] + set2["home"] + set2["away"]
+        dd_result = "✅" if sets_12_total < 70 else "❌"
+
+    return over_result, split_result, dd_result
+
+
+async def post_admin_result(session: aiohttp.ClientSession, pick: dict, score: dict, opening_line: float, result_str: str, match_dt: datetime, roi: float | None = None):
     """Post result to admin-only channel."""
     league = pick.get("league", "")
-    league_str = f"{league}\n" if league else ""
-    pick_type = "UNDER" if re.search(r'UND+ER', pick.get("pick", ""), re.IGNORECASE) else "OVER"
-    result_label = "✅ HIT" if result == "✅" else "❌ MISS"
+    league_str = f"{league} — " if league else ""
+    total = score.get("total", 0)
+    home = score.get("total_home", 0)
+    away = score.get("total_away", 0)
     roi_str = f"\nROI: **{'+' if roi and roi > 0 else ''}{roi:.2f}U**" if roi is not None else ""
 
     message = (
-        f"📊 **RESULT: {league_str}**"
-        f"{pick['player1']} vs {pick['player2']}\n"
-        f"Pick: **{pick_type}** (line {line})\n"
-        f"Score: {home_pts}+{away_pts} = **{total_pts} pts**\n"
+        f"📊 **RESULT: {league_str}{pick['player1']} vs {pick['player2']}**\n"
+        f"Pick: **{pick.get('pick', '')}**\n"
+        f"Line: {opening_line}\n"
+        f"Score: {home}+{away} = **{total} pts** ({score.get('num_sets', 0)} sets)\n"
         f"Time: {match_dt.strftime('%I:%M %p EST')}\n"
-        f"Result: **{result_label}**{roi_str}"
+        f"Result: {result_str}{roi_str}"
     )
 
     url = f"{DISCORD_API}/channels/{ADMIN_RESULTS_CHANNEL_ID}/messages"
     async with session.post(url, headers=DISCORD_HEADERS, json={"content": message}) as r:
         if r.status in (200, 201):
-            print(f"📬 Admin result posted: {pick['player1']} vs {pick['player2']} → {result_label}")
+            print(f"Admin result posted: {pick['player1']} vs {pick['player2']}")
         else:
-            print(f"⚠️ Failed to post admin result: {r.status}")
+            print(f"Failed to post admin result: {r.status}")
+
+
+async def edit_discord_pick_message(session: aiohttp.ClientSession, message_id: str, player1: str, player2: str, result: str):
     """Find the pick line in a Discord message and append the result emoji."""
     try:
-        # Fetch the current message
         url = f"{DISCORD_API}/channels/{PICKS_CHANNEL_ID}/messages/{message_id}"
         async with session.get(url, headers=DISCORD_HEADERS) as r:
             if r.status != 200:
@@ -1147,9 +1259,7 @@ async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pt
         edited = False
 
         for line in lines:
-            # Find the line with this match
             if player1.lower() in line.lower() and player2.lower() in line.lower():
-                # Only add result if line doesn't already have one
                 if not any(e in line for e in ["✅", "❌", "💀"]):
                     line = line.rstrip() + f" {result}"
                     edited = True
@@ -1159,15 +1269,15 @@ async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pt
             new_content = "\n".join(updated_lines)
             async with session.patch(url, headers=DISCORD_HEADERS, json={"content": new_content}) as r:
                 if r.status in (200, 204):
-                    print(f"✏️ Discord message updated: {player1} vs {player2} → {result}")
+                    print(f"Discord message updated: {player1} vs {player2}")
                 else:
-                    print(f"⚠️ Failed to edit Discord message: {r.status}")
+                    print(f"Failed to edit Discord message: {r.status}")
     except Exception as e:
-        print(f"⚠️ Edit message error: {e}")
+        print(f"Edit message error: {e}")
 
 
 async def auto_track_results(session: aiohttp.ClientSession):
-    """Check BetsAPI for results of pending picks and update Discord messages."""
+    """Track OVER/UNDER picks after match ends."""
     if not BETSAPI_TOKEN:
         return
 
@@ -1175,67 +1285,113 @@ async def auto_track_results(session: aiohttp.ClientSession):
     if not pending:
         return
 
-    print(f"🔍 Auto-tracking {len(pending)} pending results...")
+    print(f"Auto-tracking {len(pending)} OVER/UNDER results...")
 
     for pick in pending:
         try:
             match_dt = datetime.fromisoformat(pick["match_time"]).astimezone(EST)
-
             event = await betsapi_search_event(session, pick["player1"], pick["player2"], match_dt)
             if not event:
-                print(f"⚠️ No BetsAPI match found: {pick['player1']} vs {pick['player2']}")
                 continue
 
             event_id = str(event.get("id"))
-
-            # Fetch odds before getting score (while event may still be live)
             odds_data = await betsapi_get_odds(session, event_id)
             if odds_data:
-                print(f"💰 Odds found: line={odds_data['line']} over={odds_data['over_odds']} under={odds_data.get('under_odds')}")
                 await db_save_odds(session, pick["alert_key"], odds_data["line"], odds_data["over_odds"], odds_data.get("under_odds", 0))
 
             score = await betsapi_get_score(session, event_id)
             if not score:
                 continue
 
-            home_pts, away_pts = score
-            total_pts = home_pts + away_pts
-            pick_text = pick.get("pick", "").upper()
-
+            pick_text = pick.get("pick", "")
             is_under = bool(re.search(r'UND+ER', pick_text, re.IGNORECASE))
             line = extract_line(pick_text)
+            total = score["total"]
 
-            if is_under:
-                result = "✅" if total_pts < line else "❌"
-            else:
-                result = "✅" if total_pts > line else "❌"
+            result = "✅" if (total < line if is_under else total > line) else "❌"
+            result_str = f"OVER {result}" if not is_under else f"UNDER {result}"
 
-            # Calculate ROI if odds available
             roi = None
             if odds_data:
-                is_under_pick = bool(re.search(r'UND+ER', pick.get("pick", ""), re.IGNORECASE))
-                odds = odds_data.get("under_odds") if is_under_pick else odds_data.get("over_odds")
-                if odds and result == "✅":
-                    roi = round((float(odds) - 1) * 1, 2)  # 1U bet
-                elif result == "❌":
-                    roi = -1.0
+                odds = odds_data.get("under_odds") if is_under else odds_data.get("over_odds")
+                if odds:
+                    roi = round((float(odds) - 1), 2) if result == "✅" else -1.0
 
-            print(f"📊 {pick['player1']} vs {pick['player2']}: {home_pts}+{away_pts}={total_pts} pts (line {line}) → {result} ROI: {roi}")
-
-            # Save to DB
+            print(f"OVER/UNDER: {pick['player1']} vs {pick['player2']}: {total} pts vs line {line} → {result}")
             await db_save_auto_result(session, pick["alert_key"], result)
+            await post_admin_result(session, pick, score, line, result_str, match_dt, roi)
 
-            # Post to admin results channel
-            await post_admin_result(session, pick, total_pts, home_pts, away_pts, line, result, match_dt, roi)
-
-            # Edit the Discord message
             discord_message_id = pick.get("discord_message_id")
             if discord_message_id:
                 await edit_discord_pick_message(session, discord_message_id, pick["player1"], pick["player2"], result)
 
         except Exception as e:
-            print(f"⚠️ Auto-result error for {pick.get('player1')}: {e}")
+            print(f"Auto-result error for {pick.get('player1')}: {e}")
+        await asyncio.sleep(0.5)
 
+
+async def auto_track_split_results(session: aiohttp.ClientSession):
+    """Track SPLIT/SPLITDD picks after match ends."""
+    if not BETSAPI_TOKEN:
+        return
+
+    pending = await db_get_pending_split_results(session)
+    if not pending:
+        return
+
+    print(f"Auto-tracking {len(pending)} SPLIT/SPLITDD results...")
+
+    for pick in pending:
+        try:
+            match_dt = datetime.fromisoformat(pick["match_time"]).astimezone(EST)
+            event = await betsapi_search_event(session, pick["player1"], pick["player2"], match_dt)
+            if not event:
+                continue
+
+            event_id = str(event.get("id"))
+            score = await betsapi_get_score(session, event_id)
+            if not score:
+                continue  # Match not finished yet
+
+            pick_text = pick.get("pick", "")
+            line = extract_line(pick_text)
+            odds_data = await betsapi_get_odds(session, event_id)
+            if odds_data:
+                await db_save_odds(session, pick["alert_key"], odds_data["line"], odds_data["over_odds"], odds_data.get("under_odds", 0))
+
+            has_over = bool(re.search(r'\bOVER\b', pick_text, re.IGNORECASE))
+
+            if is_splitdd_pick(pick_text):
+                over_r, split_r, dd_r = calculate_splitdd_result(score, pick_text, line)
+                if has_over:
+                    result_str = f"OVER {over_r} + SPLIT {split_r} + DD {dd_r}"
+                    auto_result = f"{over_r}{split_r}{dd_r}"
+                else:
+                    result_str = f"SPLIT {split_r} + DD {dd_r}"
+                    auto_result = f"{split_r}{dd_r}"
+            else:
+                # Pure SPLIT
+                split_r = calculate_split_result(score, pick_text, pick["player1"], pick["player2"])
+                if has_over:
+                    is_under = bool(re.search(r'UND+ER', pick_text, re.IGNORECASE))
+                    total = score["total"]
+                    over_r = "✅" if (total < line if is_under else total > line) else "❌"
+                    result_str = f"OVER {over_r} + SPLIT {split_r}"
+                    auto_result = f"{over_r}{split_r}"
+                else:
+                    result_str = f"SPLIT {split_r}"
+                    auto_result = split_r
+
+            print(f"SPLIT: {pick['player1']} vs {pick['player2']} → {result_str}")
+            await db_save_auto_result(session, pick["alert_key"], auto_result)
+            await post_admin_result(session, pick, score, line, result_str, match_dt)
+
+            discord_message_id = pick.get("discord_message_id")
+            if discord_message_id:
+                await edit_discord_pick_message(session, discord_message_id, pick["player1"], pick["player2"], auto_result)
+
+        except Exception as e:
+            print(f"Split auto-result error for {pick.get('player1')}: {e}")
         await asyncio.sleep(0.5)
 
 
@@ -1280,6 +1436,7 @@ async def scanner_loop():
                 # Auto-track results via BetsAPI every 5 minutes
                 if BETSAPI_TOKEN and (last_result_check is None or (now_est - last_result_check).total_seconds() >= 300):
                     await auto_track_results(session)
+                    await auto_track_split_results(session)
                     last_result_check = now_est
 
                 # Check for new members every 5 minutes
