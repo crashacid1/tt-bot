@@ -964,8 +964,54 @@ async def betsapi_search_event(session: aiohttp.ClientSession, player1: str, pla
     return None
 
 
-async def betsapi_get_score(session: aiohttp.ClientSession, event_id: str) -> tuple[int, int] | None:
-    """Get the final score for an event. Returns (home_score, away_score) or None."""
+async def betsapi_get_odds(session: aiohttp.ClientSession, event_id: str) -> dict | None:
+    """Get Over/Under odds and line from BetsAPI for a table tennis event."""
+    if not BETSAPI_TOKEN:
+        return None
+    try:
+        url = (
+            f"https://api.b365api.com/v2/event/odds"
+            f"?token={BETSAPI_TOKEN}"
+            f"&event_id={event_id}"
+            f"&odds_market=3"  # Over/Under market
+        )
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            results = data.get("results", {})
+
+            # Look for the O/U market in bet365 data
+            for market_key, market_data in results.items():
+                if "_3" in market_key:  # Over/Under market
+                    odds_list = market_data.get("odds", [])
+                    for odds_entry in odds_list:
+                        handicap = odds_entry.get("handicap")
+                        over_odds = odds_entry.get("home_od")  # Over odds
+                        under_odds = odds_entry.get("away_od")  # Under odds
+                        if handicap and over_odds:
+                            return {
+                                "line": float(handicap),
+                                "over_odds": float(over_odds),
+                                "under_odds": float(under_odds) if under_odds else None
+                            }
+    except Exception as e:
+        print(f"⚠️ BetsAPI odds error: {e}")
+    return None
+
+
+async def db_save_odds(session: aiohttp.ClientSession, alert_key: str, line: float, over_odds: float, under_odds: float):
+    """Save odds data to picks table."""
+    url = f"{SUPABASE_URL}/rest/v1/picks?alert_key=eq.{alert_key}"
+    payload = {
+        "betting_line": line,
+        "over_odds": over_odds,
+        "under_odds": under_odds
+    }
+    async with session.patch(url, headers=SUPABASE_HEADERS, json=payload) as r:
+        if r.status not in (200, 204):
+            print(f"⚠️ Failed to save odds: {r.status}")
+    """Get the final score for an event. Returns (home_total_pts, away_total_pts) or None."""
     if not BETSAPI_TOKEN:
         return None
     try:
@@ -978,25 +1024,35 @@ async def betsapi_get_score(session: aiohttp.ClientSession, event_id: str) -> tu
             if not results:
                 return None
             event = results[0]
+
             # time_status 3 = ended
             if event.get("time_status") != "3":
                 return None
-            scores = event.get("ss", "")
-            if not scores:
-                return None
-            # Score format: "21-15" or "21-15,18-21,21-18"
-            # Sum all points
+
+            # Try to get individual set scores from 'scores' field
+            scores_data = event.get("scores", {})
             home_total = 0
             away_total = 0
-            for game in scores.split(","):
-                parts = game.split("-")
-                if len(parts) == 2:
+
+            if scores_data:
+                # scores is a dict like {"1": {"home": "11", "away": "9"}, "2": {...}}
+                for set_num, set_score in scores_data.items():
                     try:
-                        home_total += int(parts[0])
-                        away_total += int(parts[1])
-                    except ValueError:
+                        home_total += int(set_score.get("home", 0))
+                        away_total += int(set_score.get("away", 0))
+                    except (ValueError, TypeError):
                         pass
-            return home_total, away_total
+                print(f"📊 Set scores: {scores_data} → Total: {home_total}+{away_total}={home_total+away_total}")
+                return home_total, away_total
+
+            # Fallback to ss field if scores not available
+            ss = event.get("ss", "")
+            if ss:
+                print(f"⚠️ No set scores available, falling back to ss: {ss}")
+                # ss format for TT is usually sets won like "3-2"
+                # This is unreliable for points, return None
+                return None
+
     except Exception as e:
         print(f"⚠️ BetsAPI score error: {e}")
     return None
@@ -1039,12 +1095,13 @@ async def get_channel_message(session: aiohttp.ClientSession, message_id: str) -
         return await r.json()
 
 
-async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pts: int, home_pts: int, away_pts: int, line: float, result: str, match_dt: datetime):
+async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pts: int, home_pts: int, away_pts: int, line: float, result: str, match_dt: datetime, roi: float | None = None):
     """Post result to admin-only channel."""
     league = pick.get("league", "")
     league_str = f"{league}\n" if league else ""
     pick_type = "UNDER" if re.search(r'UND+ER', pick.get("pick", ""), re.IGNORECASE) else "OVER"
     result_label = "✅ HIT" if result == "✅" else "❌ MISS"
+    roi_str = f"\nROI: **{'+' if roi and roi > 0 else ''}{roi:.2f}U**" if roi is not None else ""
 
     message = (
         f"📊 **RESULT: {league_str}**"
@@ -1052,7 +1109,7 @@ async def post_admin_result(session: aiohttp.ClientSession, pick: dict, total_pt
         f"Pick: **{pick_type}** (line {line})\n"
         f"Score: {home_pts}+{away_pts} = **{total_pts} pts**\n"
         f"Time: {match_dt.strftime('%I:%M %p EST')}\n"
-        f"Result: **{result_label}**"
+        f"Result: **{result_label}**{roi_str}"
     )
 
     url = f"{DISCORD_API}/channels/{ADMIN_RESULTS_CHANNEL_ID}/messages"
@@ -1116,6 +1173,13 @@ async def auto_track_results(session: aiohttp.ClientSession):
                 continue
 
             event_id = str(event.get("id"))
+
+            # Fetch odds before getting score (while event may still be live)
+            odds_data = await betsapi_get_odds(session, event_id)
+            if odds_data:
+                print(f"💰 Odds found: line={odds_data['line']} over={odds_data['over_odds']} under={odds_data.get('under_odds')}")
+                await db_save_odds(session, pick["alert_key"], odds_data["line"], odds_data["over_odds"], odds_data.get("under_odds", 0))
+
             score = await betsapi_get_score(session, event_id)
             if not score:
                 continue
@@ -1132,13 +1196,23 @@ async def auto_track_results(session: aiohttp.ClientSession):
             else:
                 result = "✅" if total_pts > line else "❌"
 
-            print(f"📊 {pick['player1']} vs {pick['player2']}: {home_pts}+{away_pts}={total_pts} pts (line {line}) → {result}")
+            # Calculate ROI if odds available
+            roi = None
+            if odds_data:
+                is_under_pick = bool(re.search(r'UND+ER', pick.get("pick", ""), re.IGNORECASE))
+                odds = odds_data.get("under_odds") if is_under_pick else odds_data.get("over_odds")
+                if odds and result == "✅":
+                    roi = round((float(odds) - 1) * 1, 2)  # 1U bet
+                elif result == "❌":
+                    roi = -1.0
+
+            print(f"📊 {pick['player1']} vs {pick['player2']}: {home_pts}+{away_pts}={total_pts} pts (line {line}) → {result} ROI: {roi}")
 
             # Save to DB
             await db_save_auto_result(session, pick["alert_key"], result)
 
             # Post to admin results channel
-            await post_admin_result(session, pick, total_pts, home_pts, away_pts, line, result, match_dt)
+            await post_admin_result(session, pick, total_pts, home_pts, away_pts, line, result, match_dt, roi)
 
             # Edit the Discord message
             discord_message_id = pick.get("discord_message_id")
@@ -1169,6 +1243,7 @@ async def scanner_loop():
         monthly_report_sent = None
         welcomed_members: set = set()
         last_member_check = None
+        last_result_check = None
 
         while True:
             try:
@@ -1189,8 +1264,9 @@ async def scanner_loop():
                     nightly_sync_done = today
 
                 # Auto-track results via BetsAPI every 5 minutes
-                if BETSAPI_TOKEN and (last_member_check is None or (now_est - last_member_check).total_seconds() >= 300):
+                if BETSAPI_TOKEN and (last_result_check is None or (now_est - last_result_check).total_seconds() >= 300):
                     await auto_track_results(session)
+                    last_result_check = now_est
 
                 # Check for new members every 5 minutes
                 if last_member_check is None or (now_est - last_member_check).total_seconds() >= 300:
