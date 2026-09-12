@@ -1227,12 +1227,17 @@ async def post_admin_result(session: aiohttp.ClientSession, pick: dict, score: d
     away = score.get("total_away", 0)
     roi_str = f"\nROI: **{'+' if roi and roi > 0 else ''}{roi:.2f}U**" if roi is not None else ""
 
+    # Ensure match_dt is in EST
+    if match_dt.tzinfo is None:
+        match_dt = EST.localize(match_dt)
+    est_dt = match_dt.astimezone(EST)
+
     message = (
         f"📊 **RESULT: {league_str}{pick['player1']} vs {pick['player2']}**\n"
         f"Pick: **{pick.get('pick', '')}**\n"
         f"Line: {opening_line}\n"
         f"Score: {home}+{away} = **{total} pts** ({score.get('num_sets', 0)} sets)\n"
-        f"Time: {match_dt.strftime('%I:%M %p EST')}\n"
+        f"Time: {est_dt.strftime('%I:%M %p EST')}\n"
         f"Result: {result_str}{roi_str}"
     )
 
@@ -1285,6 +1290,8 @@ async def auto_track_results(session: aiohttp.ClientSession):
     if not pending:
         return
 
+    # Process in chronological order
+    pending.sort(key=lambda x: x.get("match_time", ""))
     print(f"Auto-tracking {len(pending)} OVER/UNDER results...")
 
     for pick in pending:
@@ -1339,6 +1346,8 @@ async def auto_track_split_results(session: aiohttp.ClientSession):
     if not pending:
         return
 
+    # Process in chronological order
+    pending.sort(key=lambda x: x.get("match_time", ""))
     print(f"Auto-tracking {len(pending)} SPLIT/SPLITDD results...")
 
     for pick in pending:
